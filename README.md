@@ -63,7 +63,7 @@ What you get after signing in:
 
 ### Authentication
 - OAuth 2.0 flow with Yahoo — handled entirely in the browser
-- Automatic token refresh; tokens persisted to `api/yahoo_tokens.json`
+- Automatic token refresh; tokens persisted to **`yahoo_tokens.json`** in the **process working directory** (with `./dev.sh` or `./start.sh`, that is the `fantasy_baseball/` project root—not under `api/`)
 
 ### League & team
 - Select a configured league and your team (same allowlist as the API: Robot League + optional LHF)
@@ -151,14 +151,16 @@ All player scoring uses age data fetched in a single bulk call from the MLB Stat
 |---|---|---|
 | `GET` | `/api/auth/status` | Check if Yahoo OAuth token is valid |
 | `GET` | `/api/auth/url` | Get Yahoo OAuth redirect URL |
+| `POST` | `/api/auth/exchange` | Exchange auth code for token (SPA / alternate client flow) |
 | `GET` | `/auth/callback` | OAuth callback handler |
 | `GET` | `/api/leagues` | List user's fantasy leagues |
+| `GET` | `/api/leagues/debug` | Raw Yahoo leagues payload (diagnostics) |
 | `GET` | `/api/leagues/configured` | Robot + LHF league keys and labels (allowlist) |
 | `GET` | `/api/leagues/{league_key}/teams` | List teams in a league |
 | `GET` | `/api/leagues/{league_key}/na-stashes` | All players in NA slots, every team in the league |
 | `GET` | `/api/leagues/{league_key}/na-adds` | NA-eligible FA sorted by OR; `?days=7&count=50`; call-up overlay |
 | `GET` | `/api/teams/{team_key}/roster` | Get team roster (optional `?date=`) |
-| `GET` | `/api/recommendations/callups` | Recently called-up players on waivers |
+| `GET` | `/api/recommendations/callups` | Recently called-up players on waivers (`?league_key=` required; optional `days=`) |
 | `GET` | `/api/optimize-lineup` | Preview or apply SP lineup optimization |
 | `POST` | `/api/transactions/add-drop` | Execute an add/drop transaction |
 | `GET` | `/api/robot-league/trade-analysis` | Trade analysis + scoring categories + category nudges |
@@ -179,13 +181,17 @@ All player scoring uses age data fetched in a single bulk call from the MLB Stat
 fantasy_baseball/
 ├── api/
 │   ├── main.py               # FastAPI app — all endpoints
-│   └── yahoo_tokens.json     # OAuth tokens (runtime, gitignored)
+│   └── __init__.py
 ├── frontend/
 │   └── index.html            # Single-page browser UI
 ├── yahoo_api.py              # Yahoo Fantasy Sports API client + scoring logic
 ├── mlb_client.py             # MLB Stats API client (call-ups, player ages)
 ├── lineup_optimizer.py       # SP lineup optimization logic
 ├── recommendations.py        # Call-ups, league NA stashes, NA adds
+├── lhf_draft.py              # LHF draft slot analysis + recommendations
+├── lhf_league_config.py      # Loads LHF rules from LHF_data.csv
+├── LHF_data.csv              # LHF roster slots / scoring categories
+├── yahoo_tokens.json         # OAuth tokens at runtime if cwd is project root (gitignored)
 ├── requirements.txt
 ├── .env                      # Your credentials (gitignored)
 ├── .env.example              # Safe template to commit
