@@ -1,0 +1,24 @@
+# Environment and secrets
+.env
+*.env
+.env.*
+!.env.example
+yahoo_tokens.json
+**/yahoo_tokens.json
+numbers.txt
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo

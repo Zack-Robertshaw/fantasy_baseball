@@ -1,0 +1,13 @@
+position,roster spots,,pitching categories,batting categories
+C,1,,IP,R
+1B,1,,W,H
+2B,1,,L,2B
+3B,1,,H,3B
+SS,1,,BB,HR
+OF,3,,K,RBI
+Util,2,,ERA,SB
+SP,3,,WHIP,BB
+RP,3,,NH,AVG
+P,4,,QS,OPS
+BN,6,,NSVH,CYC
+IL,2,,,
