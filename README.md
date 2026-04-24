@@ -1,6 +1,6 @@
 # Fantasy Baseball AI Co-Manager
 
-A Python/FastAPI app for managing Yahoo fantasy baseball rosters with a focused in-season workflow: authenticate with Yahoo, choose one of up to two configured leagues, inspect teams, and optimize lineups.
+A Python/FastAPI app for managing Yahoo fantasy baseball rosters with a focused in-season workflow: authenticate with Yahoo, choose from locally configured leagues and teams, inspect rosters, and optimize lineups.
 
 The app can also evaluate and update a roster automatically on a schedule. During each scheduled run, it checks the target team's roster for the configured date, identifies starting pitchers from Yahoo's roster-level `is_starting` signal, benches SPs who are not scheduled to start, activates confirmed starters into available `SP` or `P` slots, and then evaluates hitters with a weighted 7-day / 30-day scoring model to fill the best available batting slots. When `LINEUP_AUTO_APPLY=true`, those pitcher and batter moves are written back to Yahoo automatically; when it is `false`, the same evaluation still runs but only logs what would have changed.
 
@@ -35,6 +35,7 @@ YAHOO_CLIENT_SECRET=your_client_secret_here
 YAHOO_REDIRECT_URI=http://localhost:8000/auth/callback
 ROBOT_LEAGUE_KEY=469.l.12479
 LHF_LEAGUE_KEY=469.l.15622
+LOCAL_TEAM_PROFILES=Robot League|469.l.12479|469.l.12479.t.7;Second League|469.l.15622|469.l.15622.t.4
 LINEUP_TEAM_KEY=469.l.12479.t.7
 LINEUP_LEAGUE_KEY=469.l.12479
 LINEUP_SCHEDULE_TIMES=11:00,17:00
@@ -44,9 +45,9 @@ LINEUP_WEIGHT_7D=0.6
 LINEUP_WEIGHT_30D=0.4
 ```
 
-`ROBOT_LEAGUE_KEY` is the primary configured league. `LHF_LEAGUE_KEY` is optional and keeps a second league available in the UI and API allowlist.
+`LOCAL_TEAM_PROFILES` is the easiest way to save multiple local Yahoo teams in the browser UI. Each entry uses `Label|league_key|team_key`, separated by semicolons. The older `ROBOT_LEAGUE_KEY` and optional `LHF_LEAGUE_KEY` values still work as a fallback for league-level configuration.
 
-`LINEUP_*` settings control the daily lineup optimizer for pitchers and batters. If `LINEUP_TEAM_KEY` is blank, no scheduled job runs. `LINEUP_SCHEDULE_TIMES` accepts a comma-separated list of 24-hour `HH:MM` values in `LINEUP_SCHEDULE_TZ`, so you can run the optimizer more than once per day.
+`LINEUP_*` settings control the daily lineup optimizer for pitchers and batters. If `LINEUP_TEAM_KEY` is blank, no scheduled job runs. When the scheduler is enabled, it will run for all saved or auto-discovered local teams when available, and otherwise falls back to the legacy single `LINEUP_TEAM_KEY` target. `LINEUP_SCHEDULE_TIMES` accepts a comma-separated list of 24-hour `HH:MM` values in `LINEUP_SCHEDULE_TZ`, so you can run the optimizer more than once per day.
 
 ### 4. Run the app
 
@@ -72,9 +73,11 @@ Open [http://localhost:8000](http://localhost:8000) and click **Connect Yahoo** 
 ### Browser UI
 
 - Yahoo OAuth in the browser
-- Configured league selector with support for up to two leagues
+- Configured league selector
+- Saved local team profiles for fast switching between teams
 - Team selector for the chosen league
 - Combined pitcher + batter lineup optimization preview and apply flow
+- Batch dry-run preview across all locally configured or auto-discovered teams
 
 ### API-only tools
 
@@ -87,16 +90,28 @@ Tokens are persisted to `yahoo_tokens.json` in the process working directory. Wi
 
 ---
 
-## Two-league support
+## Local multi-team support
 
-The app still supports up to two configured Yahoo leagues:
+For local use, the app can keep a saved list of team profiles in `.env`:
+
+```text
+LOCAL_TEAM_PROFILES=Robot League|469.l.12479|469.l.12479.t.7;Second League|469.l.15622|469.l.15622.t.4
+```
+
+Each profile stores:
+
+- a label for the UI
+- the Yahoo `league_key`
+- the Yahoo `team_key`
+
+The browser UI uses those saved profiles to preselect the right team when you switch leagues.
+
+If you prefer the old setup, the app still supports league-only configuration through:
 
 - `ROBOT_LEAGUE_KEY`
 - `LHF_LEAGUE_KEY` (optional)
 
-`GET /api/leagues/configured` returns those configured league keys for the frontend selector. The add/drop API also validates that `league_key` belongs to that configured allowlist.
-
-This keeps the core workflow multi-league even after removing draft, trade, and recommendation features.
+`GET /api/leagues/configured` returns the locally configured leagues for the selector. `GET /api/teams/configured` returns saved local team profiles when present, or auto-discovers the current user's owned team in each configured league. The add/drop API continues to validate that `league_key` belongs to the configured local allowlist.
 
 ---
 
@@ -152,10 +167,12 @@ Higher `composite_score` means stronger recent performance for the league format
 | `GET` | `/api/leagues` | List the user's fantasy leagues |
 | `GET` | `/api/leagues/debug` | Return raw Yahoo leagues payload for diagnostics |
 | `GET` | `/api/leagues/configured` | Return the configured one- or two-league allowlist |
+| `GET` | `/api/teams/configured` | Return saved or auto-discovered local teams for the current login |
 | `GET` | `/api/leagues/{league_key}/teams` | List teams in a league |
 | `GET` | `/api/teams/{team_key}/roster` | Get team roster for today or a supplied `date` |
 | `GET` | `/api/optimize-lineup` | Preview or apply pitcher-only SP lineup optimization |
 | `POST` | `/api/optimize-batting-lineup` | Preview or apply combined pitcher + batter lineup optimization |
+| `POST` | `/api/optimize-all-lineups` | Preview or apply combined optimization for all local teams |
 | `POST` | `/api/transactions/add-drop` | Execute an add/drop transaction |
 
 ---
@@ -195,8 +212,8 @@ Tokens may have expired. Visit [http://localhost:8000](http://localhost:8000) an
 **Rotating credentials**  
 Go to [developer.yahoo.com/apps](https://developer.yahoo.com/apps/), regenerate your client secret, update `.env`, restart the server, and re-authenticate once.
 
-**Configured second league does not appear**  
-Set `LHF_LEAGUE_KEY` in `.env`, restart the server, and confirm the account has access to that Yahoo league.
+**Configured second league or team does not appear**  
+If you use `LOCAL_TEAM_PROFILES`, verify the format is exactly `Label|league_key|team_key` with entries separated by semicolons, then restart the server. If you use legacy league settings instead, confirm `LHF_LEAGUE_KEY` is set and the account has access to that Yahoo league.
 
 **Daily lineup automation doesn't run**  
 Confirm `LINEUP_TEAM_KEY` is set, the server is still running, and the scheduler timezone plus `LINEUP_SCHEDULE_TIMES` values are correct. Check `uvicorn` or `systemd` logs for failures.
@@ -238,6 +255,8 @@ LINEUP_AUTO_APPLY=true
 LINEUP_WEIGHT_7D=0.6
 LINEUP_WEIGHT_30D=0.4
 ```
+
+`LINEUP_TEAM_KEY` still acts as the scheduler enable switch. Once it is set, the Pi scheduler will prefer all saved or auto-discovered local teams and run each one on the configured times. If discovery is unavailable, it falls back to the single `LINEUP_TEAM_KEY`.
 
 The scheduler also supports the older single-run `LINEUP_SCHEDULE_HOUR` and `LINEUP_SCHEDULE_MINUTE` vars for backward compatibility, but `LINEUP_SCHEDULE_TIMES` is the preferred format for the Pi deployment.
 

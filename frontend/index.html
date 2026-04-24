@@ -80,6 +80,11 @@
   <div id="dashboard">
     <div class="card">
       <h2>League & Team</h2>
+      <div class="row" id="profile-row" style="display: none;">
+        <select id="profile-select">
+          <option value="">Saved team profiles...</option>
+        </select>
+      </div>
       <div class="row">
         <select id="league-select">
           <option value="">Select league...</option>
@@ -95,6 +100,7 @@
       <p class="muted">Use the selected league and team to preview or apply combined pitcher and batter lineup changes.</p>
       <div class="row">
         <button id="optimize-btn">Optimize Lineup (Preview)</button>
+        <button id="optimize-all-btn" class="secondary">Dry Run All Teams</button>
         <button id="apply-btn" class="secondary">Apply Changes</button>
       </div>
       <div id="optimize-result"></div>
@@ -103,7 +109,7 @@
 
   <script>
     const API = '/api';
-    let leagues = [], teams = [];
+    let leagues = [], teams = [], configuredTeams = [];
 
     async function checkAuth() {
       const r = await fetch(API + '/auth/status');
@@ -124,13 +130,16 @@
     };
 
     async function loadLeagues() {
-      const [rAll, rCfg] = await Promise.all([
+      const [rAll, rCfg, rTeams] = await Promise.all([
         fetch(API + '/leagues'),
         fetch(API + '/leagues/configured'),
+        fetch(API + '/teams/configured'),
       ]);
       const d = await rAll.json();
       const cfg = await rCfg.json();
+      const teamCfg = await rTeams.json();
       const configured = cfg.leagues || [];
+      configuredTeams = teamCfg.teams || [];
       const byKey = new Map((d.leagues || []).map(l => [l.league_key, l]));
       leagues = configured.map(c => {
         const y = byKey.get(c.league_key);
@@ -155,21 +164,55 @@
         opt.textContent = title;
         sel.appendChild(opt);
       });
+
+      const profileRow = document.getElementById('profile-row');
+      const profileSelect = document.getElementById('profile-select');
+      profileSelect.innerHTML = '<option value="">Saved team profiles...</option>';
+      configuredTeams.forEach((profile, index) => {
+        const opt = document.createElement('option');
+        opt.value = String(index);
+        opt.textContent = profile.label || profile.team_key;
+        profileSelect.appendChild(opt);
+      });
+      profileRow.style.display = configuredTeams.length ? 'flex' : 'none';
     }
 
-    document.getElementById('league-select').onchange = async function() {
-      const key = this.value;
+    async function loadTeamsForLeague(leagueKey, preferredTeamKey = '') {
       document.getElementById('team-select').innerHTML = '<option value="">Select team...</option>';
-      if (!key) return;
-      const r = await fetch(API + `/leagues/${encodeURIComponent(key)}/teams`);
+      if (!leagueKey) return;
+      const r = await fetch(API + `/leagues/${encodeURIComponent(leagueKey)}/teams`);
       const d = await r.json();
       teams = d.teams || [];
       teams.forEach(t => {
         const opt = document.createElement('option');
         opt.value = t.team_key;
-        opt.textContent = t.name || t.team_key;
+        const matchingProfile = configuredTeams.find(profile => profile.team_key === t.team_key);
+        opt.textContent = matchingProfile?.label
+          ? `${matchingProfile.label} — ${t.name || t.team_key}`
+          : (t.name || t.team_key);
         document.getElementById('team-select').appendChild(opt);
       });
+      if (preferredTeamKey) {
+        document.getElementById('team-select').value = preferredTeamKey;
+      }
+    }
+
+    document.getElementById('league-select').onchange = async function() {
+      const leagueKey = this.value;
+      const profile = configuredTeams.find(item => item.league_key === leagueKey);
+      await loadTeamsForLeague(leagueKey, profile?.team_key || '');
+    };
+
+    document.getElementById('profile-select').onchange = async function() {
+      if (this.value === '') {
+        return;
+      }
+      const selected = configuredTeams[Number(this.value)];
+      if (!selected) {
+        return;
+      }
+      document.getElementById('league-select').value = selected.league_key;
+      await loadTeamsForLeague(selected.league_key, selected.team_key);
     };
 
     function formatChange(item) {
@@ -217,6 +260,44 @@
       el.innerHTML = html;
     }
 
+    function renderBatchOptimizationResult(result) {
+      const el = document.getElementById('optimize-result');
+      const results = result.results || [];
+      let html = `<p class="muted">Processed ${result.teams_processed || 0} team(s); ${result.teams_with_changes || 0} with suggested changes.</p>`;
+
+      if (!results.length) {
+        el.innerHTML = html + '<span class="muted">No configured teams were available.</span>';
+        return;
+      }
+
+      results.forEach(teamResult => {
+        const pitcherDetails = teamResult.pitcher_details || [];
+        const batterDetails = teamResult.batter_details || [];
+        html += `<div class="rec-item"><strong>${teamResult.label || teamResult.team_key}</strong>`;
+        if (teamResult.error) {
+          html += `<p class="muted">${teamResult.error}</p></div>`;
+          return;
+        }
+        if (!pitcherDetails.length && !batterDetails.length) {
+          html += '<div class="success">No changes needed.</div></div>';
+          return;
+        }
+        if (pitcherDetails.length) {
+          html += '<div><span class="badge">Pitchers</span><ul>' + pitcherDetails.map(item =>
+            `<li>${formatChange(item)}</li>`
+          ).join('') + '</ul></div>';
+        }
+        if (batterDetails.length) {
+          html += '<div><span class="badge">Batters</span><ul>' + batterDetails.map(item =>
+            `<li>${formatChange(item)}</li>`
+          ).join('') + '</ul></div>';
+        }
+        html += '</div>';
+      });
+
+      el.innerHTML = html;
+    }
+
     document.getElementById('optimize-btn').onclick = async function() {
       const teamKey = document.getElementById('team-select').value;
       if (!teamKey) { alert('Select a team first'); return; }
@@ -225,6 +306,14 @@
       });
       const d = await r.json();
       renderOptimizationResult(d, 'preview');
+    };
+
+    document.getElementById('optimize-all-btn').onclick = async function() {
+      const r = await fetch(API + '/optimize-all-lineups?dry_run=true', {
+        method: 'POST',
+      });
+      const d = await r.json();
+      renderBatchOptimizationResult(d);
     };
 
     document.getElementById('apply-btn').onclick = async function() {
