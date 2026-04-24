@@ -90,44 +90,14 @@
       </div>
     </div>
 
-    <div class="card" id="trade-analysis-section">
-      <h2>Trade Analysis</h2>
-      <p class="muted">In-season: sell-high candidates and young keeper targets. Scoring categories come from Yahoo for the league you select above.</p>
-      <div class="row">
-        <span class="muted" style="font-size:0.85rem;">Robot League or Low Hanging Fruit + your team</span>
-        <button id="trade-analysis-btn">Analyze Trades</button>
-      </div>
-      <div id="trade-analysis-result" style="margin-top:0.75rem;"></div>
-    </div>
-
     <div class="card">
       <h2>Lineup Optimizer</h2>
-      <p class="muted">Ensures starting pitchers aren't left on the bench.</p>
+      <p class="muted">Use the selected league and team to preview or apply combined pitcher and batter lineup changes.</p>
       <div class="row">
         <button id="optimize-btn">Optimize Lineup (Preview)</button>
         <button id="apply-btn" class="secondary">Apply Changes</button>
       </div>
       <div id="optimize-result"></div>
-    </div>
-
-    <div class="card">
-      <h2>Call-Up Recommendations</h2>
-      <p class="muted">Players recently promoted to MLB, available on waivers.</p>
-      <button id="callups-btn">Refresh</button>
-      <div id="callups-list"></div>
-    </div>
-
-    <div class="card">
-      <h2>NA slot — league intel</h2>
-      <p class="muted"><strong>League stashes:</strong> everyone in an NA roster spot. <strong>NA adds:</strong> NA-eligible free agents sorted by Yahoo rank, with call-up urgency when a name matches recent MLB transactions.</p>
-      <div class="row">
-        <button type="button" id="na-stashes-btn" class="secondary">Load league NA stashes</button>
-        <button type="button" id="na-adds-btn">Load NA adds</button>
-      </div>
-      <h3 style="margin:0.75rem 0 0.35rem;font-size:0.95rem;color:var(--muted);">Stashes (all teams)</h3>
-      <div id="na-stashes-out" class="muted" style="font-size:0.85rem;">Select a league, then load.</div>
-      <h3 style="margin:0.75rem 0 0.35rem;font-size:0.95rem;color:var(--muted);">NA-eligible adds</h3>
-      <div id="na-adds-out" class="muted" style="font-size:0.85rem;">Select a league, then load.</div>
     </div>
   </div>
 
@@ -187,19 +157,6 @@
       });
     }
 
-    function scoringCategoriesHtml(d) {
-      const sc = d.scoring_categories;
-      if (!sc) return '';
-      const b = (sc.batting || []).map(x => x.name || x.stat_id).filter(Boolean);
-      const p = (sc.pitching || []).map(x => x.name || x.stat_id).filter(Boolean);
-      if (!b.length && !p.length) return '';
-      return `<div style="margin-bottom:1rem;padding:0.75rem;background:var(--bg);border:1px solid var(--border);border-radius:8px;font-size:0.82rem;">
-        <strong>League scoring (Yahoo)</strong>
-        <div class="muted" style="margin-top:0.35rem;"><strong>Batting:</strong> ${b.join(', ') || '—'}</div>
-        <div class="muted" style="margin-top:0.25rem;"><strong>Pitching:</strong> ${p.join(', ') || '—'}</div>
-      </div>`;
-    }
-
     document.getElementById('league-select').onchange = async function() {
       const key = this.value;
       document.getElementById('team-select').innerHTML = '<option value="">Select team...</option>';
@@ -215,176 +172,70 @@
       });
     };
 
+    function formatChange(item) {
+      const from = item.from ? String(item.from) : '';
+      const to = item.to ? String(item.to) : '';
+      const transition = from && to ? `${from} -> ${to}` : (to ? `-> ${to}` : (item.action || 'update'));
+      const reason = item.reason ? ` (${item.reason})` : '';
+      return `${item.player}: ${transition}${reason}`;
+    }
+
+    function renderOptimizationResult(result, mode) {
+      const el = document.getElementById('optimize-result');
+      const pitcherDetails = result.pitcher_details || [];
+      const batterDetails = result.batter_details || [];
+      let html = '';
+
+      if (mode === 'apply') {
+        if (result.error) {
+          html += `<p class="muted">${result.error}</p>`;
+        } else if (result.applied) {
+          html += '<p class="success">Lineup updated successfully.</p>';
+        } else {
+          html += '<p class="muted">No changes applied.</p>';
+        }
+      }
+
+      if (!pitcherDetails.length && !batterDetails.length) {
+        html += '<span class="success">Lineup looks good - no changes needed.</span>';
+        el.innerHTML = html;
+        return;
+      }
+
+      if (pitcherDetails.length) {
+        html += '<strong>Pitcher changes</strong><ul>' + pitcherDetails.map(item =>
+          `<li>${formatChange(item)}</li>`
+        ).join('') + '</ul>';
+      }
+
+      if (batterDetails.length) {
+        html += '<strong>Batter changes</strong><ul>' + batterDetails.map(item =>
+          `<li>${formatChange(item)}</li>`
+        ).join('') + '</ul>';
+      }
+
+      el.innerHTML = html;
+    }
+
     document.getElementById('optimize-btn').onclick = async function() {
       const teamKey = document.getElementById('team-select').value;
       if (!teamKey) { alert('Select a team first'); return; }
-      const r = await fetch(API + `/optimize-lineup?team_key=${encodeURIComponent(teamKey)}&dry_run=true`);
+      const r = await fetch(API + `/optimize-batting-lineup?team_key=${encodeURIComponent(teamKey)}&dry_run=true`, {
+        method: 'POST',
+      });
       const d = await r.json();
-      const el = document.getElementById('optimize-result');
-      if (d.details && d.details.length) {
-        el.innerHTML = '<strong>Suggested changes:</strong><ul>' + d.details.map(x =>
-          `<li>${x.action}: ${x.player} - ${x.reason}</li>`
-        ).join('') + '</ul>';
-      } else {
-        el.innerHTML = '<span class="success">Lineup looks good - no changes needed.</span>';
-      }
+      renderOptimizationResult(d, 'preview');
     };
 
     document.getElementById('apply-btn').onclick = async function() {
       const teamKey = document.getElementById('team-select').value;
       if (!teamKey) { alert('Select a team first'); return; }
       if (!confirm('Apply lineup changes?')) return;
-      const r = await fetch(API + `/optimize-lineup?team_key=${encodeURIComponent(teamKey)}&dry_run=false`);
+      const r = await fetch(API + `/optimize-batting-lineup?team_key=${encodeURIComponent(teamKey)}&dry_run=false`, {
+        method: 'POST',
+      });
       const d = await r.json();
-      const el = document.getElementById('optimize-result');
-      if (d.applied) {
-        el.innerHTML = '<span class="success">Lineup updated successfully.</span>';
-      } else {
-        el.innerHTML = '<span class="muted">' + (d.error || 'No changes applied.') + '</span>';
-      }
-    };
-
-    document.getElementById('callups-btn').onclick = async function() {
-      const leagueKey = document.getElementById('league-select').value;
-      if (!leagueKey) { alert('Select a league first'); return; }
-      const r = await fetch(API + `/recommendations/callups?league_key=${encodeURIComponent(leagueKey)}&days=3`);
-      const d = await r.json();
-      const list = document.getElementById('callups-list');
-      const recs = d.recommendations || [];
-      if (recs.length) {
-        list.innerHTML = recs.map(r => `
-          <div class="rec-item">
-            <strong>${r.name}</strong> (${(r.positions || []).join(', ')}) - ${r.team}
-            <br><span class="muted">${r.callup_description || ''}</span>
-          </div>
-        `).join('');
-      } else {
-        list.innerHTML = '<span class="muted">No call-up recommendations right now.</span>';
-      }
-    };
-
-    document.getElementById('na-stashes-btn').onclick = async function() {
-      const leagueKey = document.getElementById('league-select').value;
-      if (!leagueKey) { alert('Select a league first'); return; }
-      const out = document.getElementById('na-stashes-out');
-      out.innerHTML = '<span class="muted">Loading...</span>';
-      const r = await fetch(API + `/leagues/${encodeURIComponent(leagueKey)}/na-stashes`);
-      const d = await r.json();
-      if (!r.ok) {
-        out.innerHTML = '<span style="color:var(--warning)">' + (d.detail || 'Error') + '</span>';
-        return;
-      }
-      const rows = d.stashes || [];
-      if (!rows.length) {
-        out.innerHTML = '<span class="muted">No players in NA slots, or could not load rosters.</span>';
-        return;
-      }
-      out.innerHTML = rows.map(s => `
-        <div class="rec-item" style="font-size:0.85rem;">
-          <strong>${s.name}</strong>
-          <span class="badge">${(s.display_position || s.selected_position || '').toString()}</span>
-          <span class="muted"> — ${s.team_name || s.team_key}</span>
-        </div>`).join('');
-    };
-
-    document.getElementById('na-adds-btn').onclick = async function() {
-      const leagueKey = document.getElementById('league-select').value;
-      if (!leagueKey) { alert('Select a league first'); return; }
-      const out = document.getElementById('na-adds-out');
-      out.innerHTML = '<span class="muted">Loading...</span>';
-      const r = await fetch(API + `/leagues/${encodeURIComponent(leagueKey)}/na-adds?days=7&count=50`);
-      const d = await r.json();
-      if (!r.ok) {
-        out.innerHTML = '<span style="color:var(--warning)">' + (d.detail || 'Error') + '</span>';
-        return;
-      }
-      const recs = d.recommendations || [];
-      const src = d.source === 'fallback_eligibility' ? ' (fallback: NA in eligibility)' : '';
-      if (!recs.length) {
-        out.innerHTML = '<span class="muted">No NA-eligible free agents found.' + src + '</span>';
-        return;
-      }
-      const cupCount = (d.callup_urgency_count != null) ? d.callup_urgency_count : recs.filter(p => p.callup_urgency).length;
-      out.innerHTML = '<div class="muted" style="font-size:0.78rem;margin-bottom:0.5rem;">Sorted by Yahoo OR · source: ' + (d.source || '') + src
-        + ' · callup_urgency matches (window): ' + cupCount + '</div>' + recs.map(p => {
-        const rkSrc = (p.yahoo_rank_source === 'ordinal') ? ' <span class="muted" style="font-size:0.72rem;">(yahoo_rank from list order)</span>' : '';
-        const rk = '<span class="muted">yahoo_rank ' + p.yahoo_rank + rkSrc + '</span> · ';
-        const cup = '<span class="muted">callup_urgency ' + (p.callup_urgency ? 'true' : 'false') + '</span> '
-          + (p.callup_urgency ? '<span class="badge" style="background:var(--warning);color:#000;">MLB news</span> ' : '') + '';
-        const desc = p.callup_description ? '<br><span class="muted" style="font-size:0.78rem;">' + p.callup_description + '</span>' : '';
-        return `<div class="rec-item" style="font-size:0.85rem;">
-          ${rk}${cup}<strong>${p.name}</strong> (${(p.positions || []).join(', ')}) — ${p.team || ''}${desc}
-        </div>`;
-      }).join('');
-    };
-
-    // Trade Analysis
-    document.getElementById('trade-analysis-btn').onclick = async function() {
-      const leagueKey = document.getElementById('league-select').value;
-      const teamKey = document.getElementById('team-select').value;
-      if (!leagueKey) { alert('Select a league first (Robot League or Low Hanging Fruit).'); return; }
-      if (!teamKey) { alert('Select your team first (from the League & Team section above)'); return; }
-      const el = document.getElementById('trade-analysis-result');
-      el.innerHTML = '<span class="muted">Analyzing rosters...</span>';
-      const r = await fetch(API + `/robot-league/trade-analysis?team_key=${encodeURIComponent(teamKey)}&league_key=${encodeURIComponent(leagueKey)}`);
-      if (!r.ok) {
-        el.innerHTML = '<span style="color:var(--warning)">Error loading trade analysis.</span>';
-        return;
-      }
-      const d = await r.json();
-      const ageTierColors = { prospect: '#6e76d8', ascending: '#3fb950', prime: '#58a6ff', veteran: '#d29922', declining: '#f85149', unknown: '#8b949e' };
-      function playerRow(p, extra) {
-        const t = p.strategy_tier || {};
-        const color = ageTierColors[t.age_tier] || ageTierColors.unknown;
-        return `<div class="rec-item" style="font-size:0.88rem;">
-          <strong>${p.name}</strong>
-          <span class="badge" style="margin:0 0.3rem;">${(p.positions||[]).join(', ')}</span>
-          <span style="font-size:0.72rem;padding:0.15rem 0.4rem;border-radius:4px;background:${color}22;color:${color};">Age ${p.age ?? '?'} · ${t.age_tier || ''}</span>
-          <span class="muted" style="font-size:0.8rem;margin-left:0.3rem;">${p.team}</span>
-          ${p.sell_high_score != null ? `<span class="muted" style="font-size:0.75rem;">sell-high ${p.sell_high_score}</span>` : ''}
-          ${p.adjusted_sell_high_score != null ? `<span class="muted" style="font-size:0.75rem;">adj ${p.adjusted_sell_high_score}</span>` : ''}
-          ${p.keeper_score != null ? `<span class="muted" style="font-size:0.75rem;">keeper ${p.keeper_score}</span>` : ''}
-          ${p.adjusted_keeper_score != null ? `<span class="muted" style="font-size:0.75rem;">adj keeper ${p.adjusted_keeper_score}</span>` : ''}
-          ${p.category_nudge != null ? `<span class="muted" style="font-size:0.72rem;">nudge ×${p.category_nudge}</span>` : ''}
-          ${extra || ''}
-        </div>`;
-      }
-      const sellHighHtml = (d.my_sell_high || []).length
-        ? (d.my_sell_high || []).map(p => playerRow(p)).join('')
-        : '<div class="muted" style="font-size:0.85rem;">No strong sell-high candidates on your roster.</div>';
-      const buyLowHtml = (d.my_buy_low_targets || []).slice(0, 10).map(p =>
-        playerRow(p, `<span class="muted" style="font-size:0.75rem;margin-left:0.5rem;">on ${p.on_team}</span>`)
-      ).join('');
-      const partnersHtml = (d.trade_partners || []).map(tp => {
-        const trades = (tp.suggested_trades || []).map(st => `
-          <div style="padding:0.5rem;background:var(--bg);border-radius:6px;margin:0.5rem 0;font-size:0.85rem;">
-            <div><strong>Offer:</strong> ${st.offer.name} (${(st.offer.positions||[]).join(', ')}) Age ${st.offer.age ?? '?'}</div>
-            <div><strong>Receive:</strong> ${st.receive.name} (${(st.receive.positions||[]).join(', ')}) Age ${st.receive.age ?? '?'}</div>
-            <div class="muted" style="font-size:0.8rem;margin-top:0.25rem;">${st.rationale}</div>
-          </div>`).join('');
-        return `<div class="rec-item" style="margin-bottom:1rem;">
-          <h3 style="margin:0 0 0.5rem;font-size:1rem;">${tp.team}</h3>
-          <p class="muted" style="font-size:0.8rem;margin:-0.25rem 0 0.5rem;">${tp.aging_count} aging players — win-now motivated</p>
-          ${trades}
-        </div>`;
-      }).join('');
-
-      el.innerHTML = scoringCategoriesHtml(d) + `
-        <div style="margin-bottom:1.25rem;">
-          <h3 style="margin:0 0 0.5rem;font-size:1rem;">📈 Your Sell-High Candidates</h3>
-          <p class="muted" style="font-size:0.8rem;margin-top:-0.25rem;">Trade these early when hot — aging veterans with win-now value but low keeper value.</p>
-          ${sellHighHtml}
-        </div>
-        <div style="margin-bottom:1.25rem;">
-          <h3 style="margin:0 0 0.5rem;font-size:1rem;">🎯 Buy-Low Targets (young keepers on other teams)</h3>
-          <p class="muted" style="font-size:0.8rem;margin-top:-0.25rem;">Young players to target in trades — especially from win-now motivated teams.</p>
-          ${buyLowHtml || '<div class="muted" style="font-size:0.85rem;">No targets found.</div>'}
-        </div>
-        <div style="margin-bottom:1rem;">
-          <h3 style="margin:0 0 0.5rem;font-size:1rem;">🤝 Suggested Trade Scenarios</h3>
-          <p class="muted" style="font-size:0.8rem;margin-top:-0.25rem;">Teams with aging rosters are most likely to accept your sell-high players for their young assets.</p>
-          ${partnersHtml || '<div class="muted" style="font-size:0.85rem;">No specific scenarios. Build your own from sell-high + buy-low lists above.</div>'}
-        </div>`;
+      renderOptimizationResult(d, 'apply');
     };
 
     // Check URL for auth callback

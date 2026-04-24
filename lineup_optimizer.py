@@ -10,6 +10,7 @@ from yahoo_api import YahooFantasyAPI
 
 PITCHING_POSITIONS = {'SP', 'RP', 'P'}
 SP_POSITIONS = {'SP', 'P'}  # Slots we want to fill with starting SPs when they pitch
+BENCH_SLOT = "BN"
 
 
 def _parse_roster_player(player_data: dict) -> Optional[dict]:
@@ -50,6 +51,60 @@ def _parse_roster_player(player_data: dict) -> Optional[dict]:
     }
 
 
+def _today(date: Optional[str]) -> str:
+    return date or datetime.now().strftime("%Y-%m-%d")
+
+
+def _league_key_from_team_key(team_key: str) -> str:
+    if ".t." not in team_key:
+        raise ValueError(f"Invalid Yahoo team_key: {team_key}")
+    return team_key.split(".t.")[0]
+
+
+def _normalize_position(pos: str | None) -> str:
+    return str(pos or "").strip().upper()
+
+
+def _is_sp_eligible(player: dict) -> bool:
+    eligible = {
+        _normalize_position(pos)
+        for pos in player.get("eligible_positions") or player.get("positions") or []
+    }
+    display_position = player.get("display_position")
+    if display_position:
+        eligible.update(_normalize_position(pos) for pos in str(display_position).split(","))
+    return "SP" in eligible
+
+
+def _starting_pitcher_slots(api: YahooFantasyAPI, team_key: str, players: list[dict]) -> list[str]:
+    league_key = _league_key_from_team_key(team_key)
+    settings = api.get_league_scoring_settings(league_key) or {}
+    roster_positions = settings.get("roster_positions") or []
+
+    slot_inventory: list[str] = []
+    for row in roster_positions:
+        position = _normalize_position(row.get("position"))
+        if position not in SP_POSITIONS:
+            continue
+        try:
+            count = int(row.get("count") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count <= 0:
+            continue
+        slot_inventory.extend([position] * count)
+
+    # Fallback to the currently occupied active slots if league settings are unavailable.
+    if not slot_inventory:
+        slot_inventory = [
+            _normalize_position(player.get("selected_position"))
+            for player in players
+            if _normalize_position(player.get("selected_position")) in SP_POSITIONS
+        ]
+
+    return slot_inventory
+
+
 def get_optimal_lineup_changes(
     api: YahooFantasyAPI,
     team_key: str,
@@ -61,55 +116,69 @@ def get_optimal_lineup_changes(
     Returns:
         (position_changes, details): List of (player_key, new_position) and human-readable details
     """
-    date = date or datetime.now().strftime("%Y-%m-%d")
-    roster_raw = api.get_team_roster(team_key, date=date)
-    if not roster_raw:
+    date = _today(date)
+    players = api.get_team_roster_details(team_key, date=date)
+    if not players:
         return [], []
 
-    players = []
-    for key, val in roster_raw.items():
-        if key.isdigit():
-            p = _parse_roster_player(val)
-            if p:
-                players.append(p)
+    sps = [player for player in players if _is_sp_eligible(player)]
+    starting_today = [player for player in sps if player.get("is_starting") is True]
+    starting_on_bench = [
+        player
+        for player in starting_today
+        if _normalize_position(player.get("selected_position")) == BENCH_SLOT
+    ]
+    not_starting_active = [
+        player
+        for player in sps
+        if player.get("is_starting") is not True
+        and _normalize_position(player.get("selected_position")) in SP_POSITIONS
+    ]
 
-    # Identify SPs and their starting status
-    sps = [p for p in players if "SP" in p.get("position", "") or p.get("selected_position") == "SP"]
-    sps_on_bench = [p for p in sps if p["selected_position"] == "BN"]
-    sps_active = [p for p in sps if p["selected_position"] != "BN"]
+    slot_inventory = _starting_pitcher_slots(api, team_key, players)
+    benched_player_keys = {player["player_key"] for player in not_starting_active}
+    occupied_slots = [
+        _normalize_position(player.get("selected_position"))
+        for player in players
+        if player.get("player_key") not in benched_player_keys
+        and _normalize_position(player.get("selected_position")) in SP_POSITIONS
+    ]
 
-    # Check who's actually starting today
-    starting_today = []
-    not_starting_today = []
-    for p in sps:
-        info = api.is_player_starting(p["player_key"], date, verbose=False)
-        if info and info.get("is_starting"):
-            starting_today.append(p)
+    remaining_occupied = list(occupied_slots)
+    available_slots: list[str] = []
+    for slot in slot_inventory:
+        if slot in remaining_occupied:
+            remaining_occupied.remove(slot)
         else:
-            not_starting_today.append(p)
+            available_slots.append(slot)
 
-    # Build changes: move starting SPs from BN to SP slots, move non-starting from SP to BN
     changes = []
     details = []
 
-    # SPs starting today on bench -> move to SP
-    starting_on_bench = [p for p in starting_today if p["selected_position"] == "BN"]
-    # SPs not starting in active slots -> move to BN
-    not_starting_active = [p for p in not_starting_today if p["selected_position"] != "BN"]
-
-    # We need to swap: each starting-on-bench needs an SP slot; each not-starting-active frees one
-    sp_slots_to_fill = len(starting_on_bench)
-    sp_slots_freed = len(not_starting_active)
-
-    # Move non-starting SPs to BN first (free up slots)
     for p in not_starting_active:
-        changes.append((p["player_key"], "BN"))
-        details.append({"action": "bench", "player": p["name"], "reason": "Not starting today"})
+        current_slot = _normalize_position(p.get("selected_position")) or "SP"
+        changes.append((p["player_key"], BENCH_SLOT))
+        details.append(
+            {
+                "action": "bench",
+                "player": p["name"],
+                "from": current_slot,
+                "to": BENCH_SLOT,
+                "reason": "Not starting today",
+            }
+        )
 
-    # Move starting SPs from BN to SP
-    for p in starting_on_bench:
-        changes.append((p["player_key"], "SP"))
-        details.append({"action": "start", "player": p["name"], "reason": "Starting today"})
+    for p, target_slot in zip(starting_on_bench, available_slots):
+        changes.append((p["player_key"], target_slot))
+        details.append(
+            {
+                "action": "start",
+                "player": p["name"],
+                "from": BENCH_SLOT,
+                "to": target_slot,
+                "reason": "Starting today",
+            }
+        )
 
     # For roster PUT we need ALL players with position changes - Yahoo requires full roster?
     # From the docs: "You may move as many players as you like in your input XML – any players
@@ -137,7 +206,7 @@ def optimize_lineup(
     Returns:
         dict with keys: changes, details, applied, error
     """
-    date = date or datetime.now().strftime("%Y-%m-%d")
+    date = _today(date)
     changes, details = get_optimal_lineup_changes(api, team_key, date)
 
     result = {"changes": changes, "details": details, "applied": False, "error": None}

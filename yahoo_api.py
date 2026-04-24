@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 import os
 
 from dotenv import load_dotenv
+from mlb_client import get_team_schedule_map
 
 load_dotenv()
 
@@ -125,6 +126,162 @@ def _classify_strategy_tier(rank: int, age: int | None) -> dict:
         "age_tier": age_tier,
         "keeper_flag": keeper_flag,
     }
+
+
+def _extract_selected_position(player_obj) -> str | None:
+    """Extract the selected Yahoo lineup slot from a player payload."""
+    for element in player_obj or []:
+        if not isinstance(element, dict) or "selected_position" not in element:
+            continue
+        selected = element["selected_position"]
+        if isinstance(selected, list):
+            for item in selected:
+                if isinstance(item, dict) and item.get("position"):
+                    return str(item["position"])
+        elif isinstance(selected, dict) and selected.get("position"):
+            return str(selected["position"])
+    return None
+
+
+def _extract_player_rank(player_obj) -> int | None:
+    """Extract the first Yahoo rank value from a player payload."""
+    for element in player_obj or []:
+        if not isinstance(element, dict) or "player_ranks" not in element:
+            continue
+        ranks = element["player_ranks"]
+        if isinstance(ranks, list):
+            for rank_entry in ranks:
+                if not isinstance(rank_entry, dict):
+                    continue
+                if "rank" in rank_entry:
+                    try:
+                        return int(rank_entry["rank"])
+                    except (TypeError, ValueError):
+                        continue
+                player_rank = rank_entry.get("player_rank")
+                if isinstance(player_rank, dict) and player_rank.get("rank_value"):
+                    try:
+                        return int(player_rank["rank_value"])
+                    except (TypeError, ValueError):
+                        continue
+        elif isinstance(ranks, dict):
+            if "rank" in ranks:
+                try:
+                    return int(ranks["rank"])
+                except (TypeError, ValueError):
+                    return None
+            player_rank = ranks.get("player_rank")
+            if isinstance(player_rank, dict) and player_rank.get("rank_value"):
+                try:
+                    return int(player_rank["rank_value"])
+                except (TypeError, ValueError):
+                    return None
+    return None
+
+
+def _extract_starting_status(player_obj) -> tuple[bool | None, str | None]:
+    """Extract Yahoo starting-lineup status and batting order when present."""
+    for element in player_obj or []:
+        if not isinstance(element, dict):
+            continue
+        if "starting_status" not in element:
+            continue
+        is_starting = None
+        batting_order = None
+        starting_status = element.get("starting_status")
+        if isinstance(starting_status, list):
+            for item in starting_status:
+                if isinstance(item, dict) and "is_starting" in item:
+                    is_starting = bool(item["is_starting"])
+                    break
+        elif isinstance(starting_status, dict) and "is_starting" in starting_status:
+            is_starting = bool(starting_status["is_starting"])
+
+        order_block = element.get("batting_order")
+        if isinstance(order_block, list):
+            for item in order_block:
+                if isinstance(item, dict) and item.get("order_num"):
+                    batting_order = str(item["order_num"])
+                    break
+        elif isinstance(order_block, dict) and order_block.get("order_num"):
+            batting_order = str(order_block["order_num"])
+
+        return is_starting, batting_order
+    return None, None
+
+
+def _extract_player_core_info(player_obj) -> dict:
+    """Parse a Yahoo player payload into a stable, app-friendly dict."""
+    player_info = {
+        "player_key": None,
+        "name": "Unknown",
+        "team": "Unknown",
+        "display_position": None,
+        "eligible_positions": [],
+        "positions": [],
+        "selected_position": None,
+        "opponent": None,
+        "has_game_today": None,
+        "is_starting": None,
+        "batting_order": None,
+        "yahoo_rank": None,
+    }
+
+    for element in player_obj or []:
+        if isinstance(element, list):
+            for item in element:
+                if not isinstance(item, dict):
+                    continue
+                if "player_key" in item:
+                    player_info["player_key"] = item["player_key"]
+                elif "name" in item:
+                    player_info["name"] = item["name"].get("full", "Unknown")
+                elif "editorial_team_abbr" in item:
+                    player_info["team"] = item["editorial_team_abbr"]
+                elif "display_position" in item:
+                    player_info["display_position"] = item["display_position"]
+                elif "eligible_positions" in item:
+                    positions = item["eligible_positions"]
+                    if isinstance(positions, list):
+                        player_info["eligible_positions"] = [
+                            pos.get("position", pos) if isinstance(pos, dict) else str(pos)
+                            for pos in positions
+                            if (isinstance(pos, dict) and pos.get("position")) or isinstance(pos, str)
+                        ]
+
+    player_info["selected_position"] = _extract_selected_position(player_obj)
+    player_info["is_starting"], player_info["batting_order"] = _extract_starting_status(player_obj)
+    player_info["yahoo_rank"] = _extract_player_rank(player_obj)
+
+    if player_info["eligible_positions"]:
+        player_info["positions"] = list(player_info["eligible_positions"])
+    elif player_info["display_position"]:
+        player_info["positions"] = [player_info["display_position"]]
+
+    if player_info["display_position"] is None and player_info["positions"]:
+        player_info["display_position"] = player_info["positions"][0]
+
+    return player_info
+
+
+def _extract_player_stats_map(player_obj) -> dict[str, str]:
+    """Extract Yahoo stat_id -> raw value mappings from a player payload."""
+    for element in player_obj or []:
+        if not isinstance(element, dict) or "player_stats" not in element:
+            continue
+        player_stats = element["player_stats"]
+        stats = player_stats.get("stats", []) if isinstance(player_stats, dict) else []
+        stat_map: dict[str, str] = {}
+        if isinstance(stats, list):
+            for row in stats:
+                if not isinstance(row, dict):
+                    continue
+                stat = row.get("stat")
+                if not isinstance(stat, dict) or "stat_id" not in stat:
+                    continue
+                stat_map[str(stat["stat_id"])] = str(stat.get("value", ""))
+        return stat_map
+    return {}
 
 
 class YahooFantasyAPI:
@@ -606,6 +763,66 @@ class YahooFantasyAPI:
         if result:
             return result.get('fantasy_content', {}).get('team', [{}])[1].get('roster', {}).get('0', {}).get('players', {})
         return None
+
+    def get_team_roster_details(self, team_key, date=None) -> list[dict]:
+        """Return parsed roster players with slot, eligibility, and game-day metadata."""
+        roster = self.get_team_roster(team_key, date=date)
+        if not roster:
+            return []
+        schedule_map = get_team_schedule_map(date=date)
+
+        players: list[dict] = []
+        for key, val in roster.items():
+            if not key.isdigit():
+                continue
+            player_obj = val.get("player", [])
+            parsed = _extract_player_core_info(player_obj)
+            if parsed.get("player_key"):
+                team_abbr = parsed.get("team")
+                matchup = schedule_map.get(team_abbr or "")
+                if matchup:
+                    parsed["has_game_today"] = bool(matchup.get("has_game_today"))
+                    parsed["opponent"] = matchup.get("opponent")
+                elif parsed.get("has_game_today") is None:
+                    parsed["has_game_today"] = False
+                players.append(parsed)
+        return players
+
+    def get_team_roster_stats(self, team_key, date=None, stat_type="lastweek") -> list[dict]:
+        """Return parsed roster players enriched with Yahoo stat window data."""
+        endpoint = f'/team/{team_key}/roster'
+        if date:
+            endpoint += f';date={date}'
+        endpoint += f'/players/stats;type={stat_type}'
+        result = self.make_api_request(endpoint)
+        if not result:
+            return []
+
+        try:
+            roster = result.get('fantasy_content', {}).get('team', [{}])[1].get('roster', {}).get('0', {}).get('players', {})
+        except (KeyError, TypeError, IndexError):
+            return []
+
+        schedule_map = get_team_schedule_map(date=date)
+        players: list[dict] = []
+        for key, val in roster.items():
+            if not key.isdigit():
+                continue
+            player_obj = val.get("player", [])
+            parsed = _extract_player_core_info(player_obj)
+            if not parsed.get("player_key"):
+                continue
+            team_abbr = parsed.get("team")
+            matchup = schedule_map.get(team_abbr or "")
+            if matchup:
+                parsed["has_game_today"] = bool(matchup.get("has_game_today"))
+                parsed["opponent"] = matchup.get("opponent")
+            elif parsed.get("has_game_today") is None:
+                parsed["has_game_today"] = False
+            parsed["stats_map"] = _extract_player_stats_map(player_obj)
+            parsed["stat_type"] = stat_type
+            players.append(parsed)
+        return players
     
     def get_player_stats(self, player_key, stat_type="season", date=None):
         """Get stats for a specific player"""
@@ -984,7 +1201,7 @@ class YahooFantasyAPI:
         
         return player_info
     
-    def get_league_players(self, league_key, status='FA', position=None, sort=None, sort_type='season', count=25):
+    def get_league_players(self, league_key, status='FA', position=None, sort=None, sort_type='season', count=25, start=0):
         """
         Get available players in a league (waiver wire / free agents)
         
@@ -995,11 +1212,14 @@ class YahooFantasyAPI:
             sort (str): Stat ID or 'NAME', 'OR', 'AR', 'PTS' for sorting
             sort_type (str): 'season', 'date', 'week', 'lastweek', 'lastmonth'
             count (int): Number of players to return
+            start (int): Pagination offset
             
         Returns:
             dict: Parsed players data or None
         """
         endpoint = f'/league/{league_key}/players;status={status};count={count}'
+        if start:
+            endpoint += f';start={start}'
         if position:
             endpoint += f';position={position}'
         if sort:
@@ -1019,6 +1239,53 @@ class YahooFantasyAPI:
             return self._parse_players_collection(players_data)
         except (KeyError, TypeError):
             return None
+
+    def get_roster_with_rankings(self, team_key, league_key, date=None, sort_type='lastweek', count=400):
+        """
+        Return the team's roster enriched with Yahoo ranks for the requested sort window.
+
+        This fetches the daily roster for slot assignment / opponent context, then pages
+        through the league's taken players sorted by the requested window and merges the
+        ranks back onto the roster by player_key.
+        """
+        roster_players = self.get_team_roster_details(team_key, date=date)
+        if not roster_players:
+            return []
+
+        roster_keys = {player["player_key"] for player in roster_players if player.get("player_key")}
+        rank_by_key: dict[str, int | None] = {}
+
+        start = 0
+        batch_size = 25
+        while True:
+            taken_players = self.get_league_players(
+                league_key,
+                status='T',
+                sort='OR',
+                sort_type=sort_type,
+                count=batch_size,
+                start=start,
+            )
+            if not taken_players:
+                break
+
+            for index, player in enumerate(taken_players, start=1):
+                player_key = player.get("player_key")
+                if player_key in roster_keys:
+                    rank_by_key[player_key] = start + index
+
+            if len(rank_by_key) >= len(roster_keys) or len(taken_players) < batch_size:
+                break
+            start += batch_size
+
+        enriched: list[dict] = []
+        for player in roster_players:
+            enriched.append({
+                **player,
+                "rank_sort_type": sort_type,
+                "yahoo_rank": rank_by_key.get(player["player_key"]),
+            })
+        return enriched
     
     def _parse_players_collection(self, players_data):
         """Parse Yahoo players collection into a list of player dicts"""
@@ -1033,51 +1300,13 @@ class YahooFantasyAPI:
             if not player_obj:
                 continue
             
-            player_info = {
-                'player_key': None,
-                'name': 'Unknown',
-                'team': 'Unknown',
-                'positions': [],
-                'display_position': None,
-                'eligible_positions': [],
-                'yahoo_rank': None,
-            }
-            for element in player_obj:
-                if isinstance(element, list):
-                    for item in element:
-                        if isinstance(item, dict):
-                            if 'player_key' in item:
-                                player_info['player_key'] = item['player_key']
-                            elif 'name' in item:
-                                player_info['name'] = item['name'].get('full', 'Unknown')
-                            elif 'editorial_team_abbr' in item:
-                                player_info['team'] = item['editorial_team_abbr']
-                            elif 'display_position' in item:
-                                player_info['display_position'] = item['display_position']
-                            elif 'eligible_positions' in item:
-                                pos_list = item['eligible_positions']
-                                if isinstance(pos_list, list):
-                                    player_info['eligible_positions'] = [
-                                        p.get('position', p) for p in pos_list if isinstance(p, dict)
-                                    ]
-                elif isinstance(element, dict) and 'player_ranks' in element:
-                    ranks = element['player_ranks']
-                    if isinstance(ranks, list):
-                        for r in ranks:
-                            if isinstance(r, dict) and 'rank' in r:
-                                try:
-                                    player_info['yahoo_rank'] = int(r['rank'])
-                                except (ValueError, TypeError):
-                                    pass
-                                break
-            
+            player_info = _extract_player_core_info(player_obj)
             if player_info['player_key']:
-                if player_info['eligible_positions']:
-                    player_info['positions'] = player_info['eligible_positions']
-                elif player_info.get('display_position'):
-                    player_info['positions'] = [player_info['display_position']]
-                if player_info.get('display_position') is None and player_info['positions']:
-                    player_info['display_position'] = player_info['positions'][0]
+                if player_info['yahoo_rank'] is None:
+                    try:
+                        player_info['yahoo_rank'] = int(key) + 1
+                    except (TypeError, ValueError):
+                        pass
                 players.append(player_info)
         
         return players

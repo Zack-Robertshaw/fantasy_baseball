@@ -18,6 +18,7 @@ MLB_TEAM_IDS = {
 # Transaction type codes: REC=Recalled, RV=Reinstated from IL
 # OPT=Optioned (demotion - exclude)
 CALLUP_TYPE_CODES = {'REC', 'RV'}
+_TEAM_ABBR_BY_ID: dict[int, str] | None = None
 
 
 def get_player_age_lookup(season: int = 2026) -> dict:
@@ -153,3 +154,63 @@ def get_recent_callups(days: int = 3) -> list[dict]:
             })
 
     return callups
+
+
+def _get_team_abbr_by_id() -> dict[int, str]:
+    """Fetch MLB team abbreviations keyed by team id."""
+    global _TEAM_ABBR_BY_ID
+    if _TEAM_ABBR_BY_ID is not None:
+        return _TEAM_ABBR_BY_ID
+
+    url = "https://statsapi.mlb.com/api/v1/teams"
+    try:
+        response = requests.get(url, params={"sportId": 1}, timeout=15)
+        response.raise_for_status()
+        teams = response.json().get("teams", [])
+    except requests.exceptions.RequestException as e:
+        print(f"MLB API request failed (team lookup): {e}")
+        _TEAM_ABBR_BY_ID = {}
+        return _TEAM_ABBR_BY_ID
+
+    mapping: dict[int, str] = {}
+    for team in teams:
+        team_id = team.get("id")
+        abbr = team.get("abbreviation")
+        if team_id and abbr:
+            mapping[int(team_id)] = str(abbr)
+    _TEAM_ABBR_BY_ID = mapping
+    return mapping
+
+
+def get_team_schedule_map(date: Optional[str] = None) -> dict[str, dict]:
+    """
+    Return per-team daily matchup info keyed by MLB abbreviation.
+
+    Example:
+        {
+            "SEA": {"has_game_today": True, "opponent": "@ TEX"},
+            "TEX": {"has_game_today": True, "opponent": "vs SEA"},
+        }
+    """
+    target_date = date or datetime.now().strftime("%Y-%m-%d")
+    url = "https://statsapi.mlb.com/api/v1/schedule"
+    try:
+        response = requests.get(url, params={"sportId": 1, "date": target_date}, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+    except requests.exceptions.RequestException as e:
+        print(f"MLB API request failed (schedule): {e}")
+        return {}
+
+    team_lookup = _get_team_abbr_by_id()
+    out: dict[str, dict] = {}
+    for day in data.get("dates", []):
+        for game in day.get("games", []):
+            away_team = game.get("teams", {}).get("away", {}).get("team", {})
+            home_team = game.get("teams", {}).get("home", {}).get("team", {})
+            away_abbr = team_lookup.get(int(away_team["id"])) if away_team.get("id") else None
+            home_abbr = team_lookup.get(int(home_team["id"])) if home_team.get("id") else None
+            if away_abbr and home_abbr:
+                out[away_abbr] = {"has_game_today": True, "opponent": f"@ {home_abbr}"}
+                out[home_abbr] = {"has_game_today": True, "opponent": f"vs {away_abbr}"}
+    return out
