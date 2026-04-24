@@ -2,6 +2,8 @@
 
 A Python/FastAPI app for managing Yahoo fantasy baseball rosters with a focused in-season workflow: authenticate with Yahoo, choose one of up to two configured leagues, inspect teams, and optimize lineups.
 
+The app can also evaluate and update a roster automatically on a schedule. During each scheduled run, it checks the target team's roster for the configured date, identifies starting pitchers from Yahoo's roster-level `is_starting` signal, benches SPs who are not scheduled to start, activates confirmed starters into available `SP` or `P` slots, and then evaluates hitters with a weighted 7-day / 30-day scoring model to fill the best available batting slots. When `LINEUP_AUTO_APPLY=true`, those pitcher and batter moves are written back to Yahoo automatically; when it is `false`, the same evaluation still runs but only logs what would have changed.
+
 ---
 
 ## Setup
@@ -316,24 +318,6 @@ Use this as a handoff block for a future chat.
    - scarcity-first slot assignment
    - date-specific roster updates
    - benching off-day hitters
-
-### Copy/paste prompt for a new chat
-
-```text
-Continue work on the `fantasy_baseball` project.
-
-Current status:
-- Yahoo auth and roster editing are working.
-- `POST /api/optimize-batting-lineup` exists.
-- Up to two configured leagues are supported with `ROBOT_LEAGUE_KEY` and optional `LHF_LEAGUE_KEY`.
-- The batter optimizer uses real Yahoo `lastweek` / `lastmonth` hitter stats plus MLB schedule data.
-- It scores hitters with a category-based z-score blend over `R`, `HR`, `RBI`, `SB`, and `AVG`.
-- Future-date writes succeed, but Yahoo roster reads may be eventually consistent right after a write.
-
-Please read `README.md`, `batter_optimizer.py`, `yahoo_api.py`, `mlb_client.py`, and `api/main.py` first.
-
-Then implement the next highest-value improvement from the README "Next steps" section. Before coding, briefly explain which item you are taking and why.
-```
 
 ---
 
