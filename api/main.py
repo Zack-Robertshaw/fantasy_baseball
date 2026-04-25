@@ -21,6 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from batter_optimizer import optimize_batting_lineup
 from lineup_optimizer import _parse_roster_player, optimize_lineup
+from notifier import (
+    format_optimization_email,
+    send_notification,
+    should_notify_optimization_results,
+)
 from yahoo_api import YahooFantasyAPI
 
 logger = logging.getLogger(__name__)
@@ -303,6 +308,15 @@ def _scheduled_team_profiles(api: YahooFantasyAPI) -> list[dict]:
     ]
 
 
+def _league_label(league_key: str | None) -> str:
+    league_key = (league_key or "").strip()
+    if league_key and league_key == ROBOT_LEAGUE_KEY.strip():
+        return "Robot League"
+    if league_key and league_key == LHF_LEAGUE_KEY.strip():
+        return "Low Hanging Fruit"
+    return league_key
+
+
 def _run_combined_optimization(
     api: YahooFantasyAPI,
     team_key: str,
@@ -379,6 +393,7 @@ def _run_scheduled_optimization() -> None:
             return
 
         roster_date = _scheduled_today(timezone_name)
+        scheduled_results = []
         for profile in team_profiles:
             team_key = profile["team_key"]
             result = _run_combined_optimization(
@@ -399,6 +414,24 @@ def _run_scheduled_optimization() -> None:
                 (result.get("summary") or {}).get("total_changes_count", 0),
                 result.get("error"),
             )
+            scheduled_results.append(
+                {
+                    "label": profile.get("label"),
+                    "league_label": _league_label(profile.get("league_key")),
+                    "league_key": profile.get("league_key"),
+                    "team_key": team_key,
+                    "result": result,
+                }
+            )
+        try:
+            if should_notify_optimization_results(scheduled_results):
+                subject, body_html = format_optimization_email(
+                    scheduled_results,
+                    dry_run=not auto_apply,
+                )
+                send_notification(subject, body_html)
+        except Exception:
+            logger.exception("Failed to prepare lineup notification email")
     except Exception:
         logger.exception("Scheduled lineup optimization failed")
 
