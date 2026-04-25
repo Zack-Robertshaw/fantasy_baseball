@@ -21,6 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from batter_optimizer import optimize_batting_lineup
 from lineup_optimizer import _parse_roster_player, optimize_lineup
+from notifier import (
+    format_optimization_email,
+    send_notification,
+    should_notify_optimization_results,
+)
 from yahoo_api import YahooFantasyAPI
 
 logger = logging.getLogger(__name__)
@@ -43,6 +48,154 @@ class AddDropRequest(BaseModel):
 
 class ExchangeRequest(BaseModel):
     code: str
+
+
+def _team_is_owned_by_current_login(team_data: list | dict) -> bool:
+    for element in team_data if isinstance(team_data, list) else [team_data]:
+        if isinstance(element, list):
+            if _team_is_owned_by_current_login(element):
+                return True
+            continue
+        if not isinstance(element, dict):
+            continue
+        if element.get("is_owned_by_current_login") in {1, "1", True, "true"}:
+            return True
+        managers = element.get("managers")
+        if isinstance(managers, list):
+            for row in managers:
+                manager = row.get("manager") if isinstance(row, dict) else None
+                if isinstance(manager, dict) and manager.get("is_current_login") in {1, "1", True, "true"}:
+                    return True
+    return False
+
+
+def _extract_current_login_team_profiles(league_key: str, teams_data: dict) -> list[dict]:
+    profiles: list[dict] = []
+    try:
+        teams_obj = teams_data.get("teams", teams_data)
+        for key, value in teams_obj.items():
+            if not key.isdigit():
+                continue
+            team_data = value.get("team", [])
+            if not _team_is_owned_by_current_login(team_data):
+                continue
+            team_key = None
+            name = "My Team"
+            for element in team_data:
+                if isinstance(element, list):
+                    for item in element:
+                        if not isinstance(item, dict):
+                            continue
+                        if "team_key" in item:
+                            team_key = item["team_key"]
+                        elif "name" in item:
+                            name = item["name"]
+                elif isinstance(element, dict):
+                    if "team_key" in element:
+                        team_key = element["team_key"]
+                    elif "name" in element:
+                        name = element["name"]
+            if team_key:
+                profiles.append(
+                    {
+                        "label": name,
+                        "league_key": league_key,
+                        "team_key": team_key,
+                    }
+                )
+    except (KeyError, TypeError, AttributeError):
+        return []
+    return profiles
+
+
+def _configured_team_profiles() -> list[dict]:
+    """
+    Parse optional local saved team profiles.
+
+    Format:
+        LOCAL_TEAM_PROFILES=Label|league_key|team_key;Other Team|league_key|team_key
+    """
+    raw = os.getenv("LOCAL_TEAM_PROFILES", "").strip()
+    profiles: list[dict] = []
+    if not raw:
+        return profiles
+
+    for chunk in raw.split(";"):
+        value = chunk.strip()
+        if not value:
+            continue
+        parts = [part.strip() for part in value.split("|")]
+        if len(parts) != 3:
+            logger.warning("Ignoring invalid LOCAL_TEAM_PROFILES entry: %s", value)
+            continue
+        label, league_key, team_key = parts
+        if not label or not league_key or not team_key:
+            logger.warning("Ignoring incomplete LOCAL_TEAM_PROFILES entry: %s", value)
+            continue
+        if ".t." not in team_key:
+            logger.warning("Ignoring LOCAL_TEAM_PROFILES entry with invalid team key: %s", value)
+            continue
+        derived_league_key = team_key.split(".t.")[0]
+        if derived_league_key != league_key:
+            logger.warning(
+                "Ignoring LOCAL_TEAM_PROFILES entry with mismatched league/team: %s",
+                value,
+            )
+            continue
+        profiles.append(
+            {
+                "label": label,
+                "league_key": league_key,
+                "team_key": team_key,
+            }
+        )
+    return profiles
+
+
+def _configured_league_entries() -> list[dict]:
+    profiles = _configured_team_profiles()
+    if profiles:
+        entries: list[dict] = []
+        seen: set[str] = set()
+        for profile in profiles:
+            league_key = profile["league_key"].strip()
+            if not league_key or league_key in seen:
+                continue
+            seen.add(league_key)
+            entries.append({"league_key": league_key, "label": profile["label"]})
+        return entries
+
+    entries = []
+    robot_league_key = ROBOT_LEAGUE_KEY.strip()
+    if robot_league_key:
+        entries.append({"league_key": robot_league_key, "label": "Robot League"})
+    lhf_league_key = LHF_LEAGUE_KEY.strip()
+    if lhf_league_key:
+        entries.append({"league_key": lhf_league_key, "label": "Low Hanging Fruit"})
+    return entries
+
+
+def _resolved_team_profiles(api: YahooFantasyAPI | None = None) -> list[dict]:
+    profiles = _configured_team_profiles()
+    if profiles or api is None:
+        return profiles
+
+    resolved: list[dict] = []
+    seen_team_keys: set[str] = set()
+    for entry in _configured_league_entries():
+        league_key = entry.get("league_key", "").strip()
+        if not league_key:
+            continue
+        teams_raw = api.get_league_teams(league_key)
+        if not teams_raw:
+            continue
+        for profile in _extract_current_login_team_profiles(league_key, {"teams": teams_raw}):
+            team_key = profile["team_key"]
+            if team_key in seen_team_keys:
+                continue
+            seen_team_keys.add(team_key)
+            resolved.append(profile)
+    return resolved
 
 
 def _get_api() -> YahooFantasyAPI:
@@ -121,6 +274,49 @@ def _lineup_schedule_times() -> list[tuple[int, int]]:
     return [(11, 0), (17, 0)]
 
 
+def _scheduled_team_profiles(api: YahooFantasyAPI) -> list[dict]:
+    """
+    Resolve the scheduler's team targets.
+
+    If local team profiles or discoverable owned teams exist, run all of them.
+    Otherwise fall back to the legacy single-team LINEUP_TEAM_KEY path.
+    """
+    profiles = _resolved_team_profiles(api)
+    if profiles:
+        return profiles
+
+    team_key = os.getenv("LINEUP_TEAM_KEY", "").strip()
+    if not team_key:
+        return []
+
+    configured_league_key = os.getenv("LINEUP_LEAGUE_KEY", "").strip()
+    derived_league_key = team_key.split(".t.")[0]
+    if configured_league_key and configured_league_key != derived_league_key:
+        logger.warning(
+            "LINEUP_LEAGUE_KEY (%s) does not match derived league key (%s) for team %s",
+            configured_league_key,
+            derived_league_key,
+            team_key,
+        )
+
+    return [
+        {
+            "label": "Scheduled Team",
+            "league_key": derived_league_key,
+            "team_key": team_key,
+        }
+    ]
+
+
+def _league_label(league_key: str | None) -> str:
+    league_key = (league_key or "").strip()
+    if league_key and league_key == ROBOT_LEAGUE_KEY.strip():
+        return "Robot League"
+    if league_key and league_key == LHF_LEAGUE_KEY.strip():
+        return "Low Hanging Fruit"
+    return league_key
+
+
 def _run_combined_optimization(
     api: YahooFantasyAPI,
     team_key: str,
@@ -171,60 +367,75 @@ def _run_combined_optimization(
         "changes": [*pitcher_changes, *batter_changes],
         "details": [*pitcher_details, *batter_details],
         "summary": summary,
-        "applied": bool(applied_components) and all(applied_components),
+        "applied": any(applied_components),
         "error": "; ".join(errors) if errors else None,
         "pitcher_changes": pitcher_changes,
         "pitcher_details": pitcher_details,
         "pitcher_applied": bool(pitcher_result.get("applied")),
+        "pitcher_apply_result": pitcher_result.get("apply_result"),
         "pitcher_error": pitcher_result.get("error"),
         "batter_changes": batter_changes,
         "batter_details": batter_details,
         "batter_summary": batter_result.get("summary"),
         "batter_applied": bool(batter_result.get("applied")),
+        "batter_apply_result": batter_result.get("apply_result"),
         "batter_error": batter_result.get("error"),
     }
 
 
 def _run_scheduled_optimization() -> None:
-    team_key = os.getenv("LINEUP_TEAM_KEY", "").strip()
-    configured_league_key = os.getenv("LINEUP_LEAGUE_KEY", "").strip()
     timezone_name = os.getenv("LINEUP_SCHEDULE_TZ", "US/Eastern")
     auto_apply = _env_bool("LINEUP_AUTO_APPLY", False)
     weight_7d, weight_30d = _lineup_weights()
 
-    if not team_key:
-        return
-
     try:
-        derived_league_key = team_key.split(".t.")[0]
-        if configured_league_key and configured_league_key != derived_league_key:
-            logger.warning(
-                "LINEUP_LEAGUE_KEY (%s) does not match derived league key (%s) for team %s",
-                configured_league_key,
-                derived_league_key,
-                team_key,
-            )
-
         api = _get_api()
-        result = _run_combined_optimization(
-            api,
-            team_key,
-            date=_scheduled_today(timezone_name),
-            dry_run=not auto_apply,
-            weight_7d=weight_7d,
-            weight_30d=weight_30d,
-        )
-        logger.info(
-            "Scheduled lineup optimization finished: team=%s dry_run=%s pitcher_changes=%d batter_changes=%d total_changes=%d error=%s",
-            team_key,
-            not auto_apply,
-            len(result.get("pitcher_changes") or []),
-            len(result.get("batter_changes") or []),
-            (result.get("summary") or {}).get("total_changes_count", 0),
-            result.get("error"),
-        )
+        team_profiles = _scheduled_team_profiles(api)
+        if not team_profiles:
+            return
+
+        roster_date = _scheduled_today(timezone_name)
+        scheduled_results = []
+        for profile in team_profiles:
+            team_key = profile["team_key"]
+            result = _run_combined_optimization(
+                api,
+                team_key,
+                date=roster_date,
+                dry_run=not auto_apply,
+                weight_7d=weight_7d,
+                weight_30d=weight_30d,
+            )
+            logger.info(
+                "Scheduled lineup optimization finished: team=%s label=%s dry_run=%s pitcher_changes=%d batter_changes=%d total_changes=%d error=%s",
+                team_key,
+                profile.get("label"),
+                not auto_apply,
+                len(result.get("pitcher_changes") or []),
+                len(result.get("batter_changes") or []),
+                (result.get("summary") or {}).get("total_changes_count", 0),
+                result.get("error"),
+            )
+            scheduled_results.append(
+                {
+                    "label": profile.get("label"),
+                    "league_label": _league_label(profile.get("league_key")),
+                    "league_key": profile.get("league_key"),
+                    "team_key": team_key,
+                    "result": result,
+                }
+            )
+        try:
+            if should_notify_optimization_results(scheduled_results):
+                subject, body_html = format_optimization_email(
+                    scheduled_results,
+                    dry_run=not auto_apply,
+                )
+                send_notification(subject, body_html)
+        except Exception:
+            logger.exception("Failed to prepare lineup notification email")
     except Exception:
-        logger.exception("Scheduled lineup optimization failed for team %s", team_key)
+        logger.exception("Scheduled lineup optimization failed")
 
 
 def _extract_leagues(fantasy_content: dict) -> list[dict]:
@@ -287,9 +498,11 @@ def _extract_teams(teams_data: dict) -> list[dict]:
 
 
 def _allowed_league_keys() -> frozenset[str]:
-    keys = {ROBOT_LEAGUE_KEY.strip()}
-    if LHF_LEAGUE_KEY.strip():
-        keys.add(LHF_LEAGUE_KEY.strip())
+    keys = {
+        entry["league_key"].strip()
+        for entry in _configured_league_entries()
+        if entry.get("league_key")
+    }
     return frozenset(keys)
 
 
@@ -340,10 +553,65 @@ def list_leagues():
 @app.get("/api/leagues/configured")
 def configured_leagues():
     """Return the app-supported configured leagues for the UI."""
-    leagues = [{"league_key": ROBOT_LEAGUE_KEY.strip(), "label": "Robot League"}]
-    if LHF_LEAGUE_KEY.strip():
-        leagues.append({"league_key": LHF_LEAGUE_KEY.strip(), "label": "Low Hanging Fruit"})
-    return {"leagues": leagues}
+    return {"leagues": _configured_league_entries()}
+
+
+@app.get("/api/teams/configured")
+def configured_teams():
+    """Return optional saved local team profiles for faster switching in the UI."""
+    api = _get_api()
+    if not api._ensure_valid_token():
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return {"teams": _resolved_team_profiles(api)}
+
+
+def _run_all_configured_optimizations(
+    api: YahooFantasyAPI,
+    date: str | None = None,
+    dry_run: bool = True,
+) -> dict:
+    profiles = _resolved_team_profiles(api)
+    if not profiles:
+        raise HTTPException(
+            status_code=400,
+            detail="No configured or discoverable local teams were found",
+        )
+
+    weight_7d, weight_30d = _lineup_weights()
+    results: list[dict] = []
+    errors: list[str] = []
+    teams_with_changes = 0
+
+    for profile in profiles:
+        result = _run_combined_optimization(
+            api,
+            profile["team_key"],
+            date=date,
+            dry_run=dry_run,
+            weight_7d=weight_7d,
+            weight_30d=weight_30d,
+        )
+        if (result.get("summary") or {}).get("total_changes_count", 0) > 0:
+            teams_with_changes += 1
+        if result.get("error"):
+            errors.append(f'{profile["label"]}: {result["error"]}')
+        results.append(
+            {
+                "label": profile["label"],
+                "league_key": profile["league_key"],
+                "team_key": profile["team_key"],
+                **result,
+            }
+        )
+
+    return {
+        "date": date or datetime.now().strftime("%Y-%m-%d"),
+        "dry_run": dry_run,
+        "results": results,
+        "teams_processed": len(results),
+        "teams_with_changes": teams_with_changes,
+        "errors": errors,
+    }
 
 
 @app.get("/api/leagues/debug")
@@ -421,6 +689,23 @@ def optimize_batting_lineup_post(
         dry_run=dry_run,
         weight_7d=weight_7d,
         weight_30d=weight_30d,
+    )
+
+
+@app.post("/api/optimize-all-lineups")
+def optimize_all_lineups_post(
+    date: str | None = None,
+    dry_run: bool = Query(True),
+):
+    """Preview or apply combined pitcher and batter optimization for all local teams."""
+    api = _get_api()
+    if not api._ensure_valid_token():
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    roster_date = date or datetime.now().strftime("%Y-%m-%d")
+    return _run_all_configured_optimizations(
+        api,
+        date=roster_date,
+        dry_run=dry_run,
     )
 
 
