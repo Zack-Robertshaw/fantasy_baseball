@@ -2,7 +2,7 @@
 
 A Python/FastAPI app for managing Yahoo fantasy baseball rosters with a focused in-season workflow: authenticate with Yahoo, choose from locally configured leagues and teams, inspect rosters, and optimize lineups.
 
-The app can also evaluate and update a roster automatically on a schedule. During each scheduled run, it checks the target team's roster for the configured date, identifies starting pitchers from Yahoo's roster-level `is_starting` signal, benches SPs who are not scheduled to start, activates confirmed starters into available `SP` or `P` slots, and then evaluates hitters with a weighted 7-day / 30-day scoring model to fill the best available batting slots. When `LINEUP_AUTO_APPLY=true`, those pitcher and batter moves are written back to Yahoo automatically; when it is `false`, the same evaluation still runs but only logs what would have changed.
+The app will evaluate and update a roster automatically on a schedule. During each scheduled run, it checks the target team's roster for the configured date, identifies starting pitchers from Yahoo's roster-level `is_starting` signal, benches SPs who are not scheduled to start, activates confirmed starters into available `SP` or `P` slots, and then evaluates hitters with a weighted 7-day / 30-day scoring model to fill the best available batting slots. Batters confirmed as not starting by Yahoo (the red X flag) are automatically benched regardless of their composite score. When `LINEUP_AUTO_APPLY=true`, those pitcher and batter moves are written back to Yahoo one player at a time so a single locked or in-game player does not block every other move; when it is `false`, the same evaluation still runs but only logs what would have changed. After each scheduled run, the app sends a combined email summary across all teams when email notifications are enabled.
 
 ---
 
@@ -94,6 +94,7 @@ Open [http://localhost:8000](http://localhost:8000) and click **Connect Yahoo** 
 - Add/drop transactions
 - Combined lineup optimization for a selected date
 - Daily scheduled pitcher + batter optimization through APScheduler
+- Email notifications with per-player Applied/Failed/Preview status after each scheduled run
 
 Tokens are persisted to `yahoo_tokens.json` in the process working directory. With `./dev.sh` or `./start.sh`, that is the `fantasy_baseball/` project root.
 
@@ -160,8 +161,11 @@ Higher `composite_score` means stronger recent performance for the league format
 
 - Pitchers are untouched by the batter optimizer
 - Hitters without a scheduled game for the target date are benched
+- Hitters with a game today but confirmed not starting by Yahoo (`is_starting` is `false`) are benched with a distinct reason
+- Hitters whose starting status is unknown (`is_starting` is `null`) remain eligible and are ranked by composite score
 - Remaining active slots are filled with scarcity-first assignment so multi-position hitters do not block thinner positions
 - The endpoint accepts an explicit `date`, so future editable dates can be optimized too
+- Roster edits are sent to Yahoo one player at a time so a locked or in-game player only blocks its own move
 
 ---
 
@@ -199,6 +203,7 @@ fantasy_baseball/
 ├── mlb_client.py             # MLB schedule and player data helpers
 ├── lineup_optimizer.py       # SP lineup optimization logic
 ├── batter_optimizer.py       # Daily batter lineup optimization logic
+├── notifier.py               # Email notifications for scheduled lineup runs
 ├── yahoo_tokens.json         # OAuth tokens at runtime if cwd is project root (gitignored)
 ├── fantasy-baseball.service  # Example systemd unit for Raspberry Pi deployment
 ├── requirements.txt
@@ -288,7 +293,7 @@ sudo systemctl start fantasy-baseball
 sudo systemctl status fantasy-baseball
 ```
 
-The service reads `/home/pi/fantasy_baseball/.env` automatically through `EnvironmentFile`, so updating schedule or credential settings only requires editing `.env` and restarting the service.
+The service reads `/home/pi/fantasy_baseball/.env` automatically through `EnvironmentFile`, so updating schedule or credential settings only requires editing `.env` and restarting the service with `sudo systemctl restart fantasy-baseball`.
 
 ### 5. Trigger on demand if needed
 
@@ -328,6 +333,9 @@ Use this as a handoff block for a future chat.
 - Up to two configured leagues are still supported through `ROBOT_LEAGUE_KEY` and optional `LHF_LEAGUE_KEY`
 - The batter optimizer uses Yahoo `lastweek` and `lastmonth` hitter stats plus MLB schedule data
 - The current scoring model is a category-based z-score blend across `R`, `HR`, `RBI`, `SB`, and `AVG`
+- Batters confirmed not starting by Yahoo are automatically benched; unknown starting status keeps them eligible
+- Roster edits are sent per-player so one locked player does not block every other move
+- Email notifications send a combined summary with league, team, and per-player Applied/Failed/Preview status
 - Future-date lineup writes work, but Yahoo roster reads can lag briefly after a successful write
 
 ### Recommended backlog
@@ -346,15 +354,12 @@ Use this as a handoff block for a future chat.
    - score_30d
    - composite_score
 4. Add a multi-day preview/apply endpoint, for example `start_date` and `end_date`.
-5. Improve schedule and lineup confidence by distinguishing:
-   - team has game
-   - hitter is in the announced starting lineup
-   - hitter is only projected to be available
-6. Add tests around:
+5. Add tests around:
    - category score calculation
    - scarcity-first slot assignment
    - date-specific roster updates
-   - benching off-day hitters
+   - benching off-day and confirmed-bench hitters
+   - per-player partial apply logic
 
 ---
 

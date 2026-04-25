@@ -55,11 +55,40 @@ def _entry_league(entry: dict) -> str:
     return str(entry.get("league_label") or entry.get("league_key") or "League")
 
 
-def _move_rows(entry: dict, section: str, details: list[dict]) -> list[str]:
+def _apply_status(result: dict, section: str, detail: dict, dry_run: bool) -> str:
+    if dry_run:
+        return "Preview"
+
+    apply_result_key = f"{section.lower()}_apply_result"
+    apply_result = result.get(apply_result_key) or {}
+    if not apply_result:
+        return "Not attempted"
+
+    player_key = detail.get("player_key")
+    to_position = detail.get("to")
+    applied = {
+        (move.get("player_key"), move.get("position"))
+        for move in apply_result.get("applied", [])
+    }
+    failed = {
+        (move.get("player_key"), move.get("position"))
+        for move in apply_result.get("failed", [])
+    }
+    move_key = (player_key, to_position)
+    if move_key in applied:
+        return "Applied"
+    if move_key in failed:
+        return "Failed"
+    return "Unknown"
+
+
+def _move_rows(entry: dict, section: str, details: list[dict], dry_run: bool) -> list[str]:
+    result = entry.get("result") or {}
     league = html.escape(_entry_league(entry))
     label = html.escape(_entry_label(entry))
     rows = []
     for detail in details:
+        update_status = html.escape(_apply_status(result, section, detail, dry_run))
         player = html.escape(str(detail.get("player") or "Unknown"))
         action = html.escape(str(detail.get("action") or "move").title())
         from_position = html.escape(str(detail.get("from") or ""))
@@ -78,6 +107,7 @@ def _move_rows(entry: dict, section: str, details: list[dict]) -> list[str]:
             f"<td>{player}</td>"
             f"<td>{action}</td>"
             f"<td>{transition}</td>"
+            f"<td>{update_status}</td>"
             f"<td>{reason}</td>"
             "</tr>"
         )
@@ -132,8 +162,8 @@ def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, 
     rows: list[str] = []
     for entry in results:
         result = entry.get("result") or {}
-        rows.extend(_move_rows(entry, "Pitcher", result.get("pitcher_details") or []))
-        rows.extend(_move_rows(entry, "Batter", result.get("batter_details") or []))
+        rows.extend(_move_rows(entry, "Pitcher", result.get("pitcher_details") or [], dry_run))
+        rows.extend(_move_rows(entry, "Batter", result.get("batter_details") or [], dry_run))
 
     table_html = ""
     if rows:
@@ -142,7 +172,7 @@ def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, 
             "<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">"
             "<thead><tr>"
             "<th>League</th><th>Team</th><th>Group</th><th>Player</th>"
-            "<th>Action</th><th>Move</th><th>Reason</th>"
+            "<th>Action</th><th>Move</th><th>Update</th><th>Reason</th>"
             "</tr></thead>"
             f"<tbody>{''.join(rows)}</tbody>"
             "</table>"

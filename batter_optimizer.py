@@ -397,6 +397,7 @@ def get_optimal_batting_lineup_changes(
             "movable_batters": 0,
             "playing_batters": 0,
             "off_day_batters": 0,
+            "confirmed_bench_batters": 0,
             "changes_count": 0,
             "warning": "No active batting slots were returned from Yahoo league settings",
         }
@@ -406,8 +407,17 @@ def get_optimal_batting_lineup_changes(
         for player in players
         if not _is_pitcher_only(player) and not _is_locked_player(player)
     ]
-    playing_batters = [player for player in movable_batters if _has_game_today(player)]
+    playing_batters = [
+        player
+        for player in movable_batters
+        if _has_game_today(player) and player.get("is_starting") is not False
+    ]
     off_day_batters = [player for player in movable_batters if player.get("has_game_today") is False]
+    confirmed_bench_batters = [
+        player
+        for player in movable_batters
+        if _has_game_today(player) and player.get("is_starting") is False
+    ]
 
     assignments, assignment_details = _assign_slots(playing_batters, active_slots)
 
@@ -415,6 +425,8 @@ def get_optimal_batting_lineup_changes(
     for player in playing_batters:
         desired_positions[player["player_key"]] = assignments.get(player["player_key"], BENCH_SLOT)
     for player in off_day_batters:
+        desired_positions[player["player_key"]] = BENCH_SLOT
+    for player in confirmed_bench_batters:
         desired_positions[player["player_key"]] = BENCH_SLOT
 
     changes: list[tuple[str, str]] = []
@@ -428,12 +440,15 @@ def get_optimal_batting_lineup_changes(
             details.append(
                 {
                     "action": "move",
+                    "player_key": player_key,
                     "player": player["name"],
                     "from": current,
                     "to": desired,
                     "reason": (
                         "Benching off-day batter"
                         if player.get("has_game_today") is False
+                        else "Confirmed not in starting lineup"
+                        if player.get("is_starting") is False
                         else "Recent performance optimization"
                     ),
                     "score_7d": player.get("score_7d"),
@@ -456,6 +471,7 @@ def get_optimal_batting_lineup_changes(
         "movable_batters": len(movable_batters),
         "playing_batters": len(playing_batters),
         "off_day_batters": len(off_day_batters),
+        "confirmed_bench_batters": len(confirmed_bench_batters),
         "changes_count": len(changes),
     }
     return changes, details, summary
@@ -491,10 +507,16 @@ def optimize_batting_lineup(
     if not changes or dry_run:
         return result
 
-    response = api.edit_roster(team_key, date, changes)
-    if response is None:
+    response = api.edit_roster_safe(team_key, date, changes)
+    result["apply_result"] = response
+    result["applied_changes"] = response.get("applied", [])
+    result["failed_changes"] = response.get("failed", [])
+    if result["applied_changes"]:
+        result["applied"] = True
+    else:
         result["error"] = "Failed to apply batting lineup changes"
         return result
 
-    result["applied"] = True
+    if result["failed_changes"]:
+        result["error"] = f"Applied {len(result['applied_changes'])} of {len(changes)} batting lineup changes"
     return result

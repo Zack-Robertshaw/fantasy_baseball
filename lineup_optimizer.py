@@ -161,6 +161,7 @@ def get_optimal_lineup_changes(
         details.append(
             {
                 "action": "bench",
+                "player_key": p["player_key"],
                 "player": p["name"],
                 "from": current_slot,
                 "to": BENCH_SLOT,
@@ -173,6 +174,7 @@ def get_optimal_lineup_changes(
         details.append(
             {
                 "action": "start",
+                "player_key": p["player_key"],
                 "player": p["name"],
                 "from": BENCH_SLOT,
                 "to": target_slot,
@@ -217,10 +219,19 @@ def optimize_lineup(
     if dry_run:
         return result
 
-    resp = api.edit_roster(team_key, date, changes)
-    if resp is not None:
+    resp = api.edit_roster_safe(team_key, date, changes)
+    result["apply_result"] = resp
+    result["applied_changes"] = resp.get("applied", [])
+    result["failed_changes"] = resp.get("failed", [])
+    if result["applied_changes"]:
         result["applied"] = True
     else:
         result["error"] = "Failed to apply lineup changes"
+    if result["failed_changes"]:
+        result["error"] = (
+            f"Applied {len(result['applied_changes'])} of {len(changes)} pitcher lineup changes"
+            if result["applied_changes"]
+            else "Failed to apply lineup changes"
+        )
 
     return result

@@ -1618,6 +1618,32 @@ class YahooFantasyAPI:
 </fantasy_content>'''
         
         return self.make_api_request_xml(f'/team/{team_key}/roster', method='PUT', xml_body=xml_body)
+
+    def edit_roster_safe(self, team_key, date, position_changes):
+        """
+        Edit lineup one player at a time so one locked player does not block every move.
+
+        Yahoo rejects a roster PUT if any included player is no longer editable. Sending
+        individual PUTs lets editable players move while locked players fail independently.
+        """
+        result = {
+            "applied": [],
+            "failed": [],
+        }
+        ordered_changes = sorted(
+            position_changes,
+            key=lambda change: 0 if str(change[1]).upper() == "BN" else 1,
+        )
+        for player_key, position in ordered_changes:
+            response = self.edit_roster(team_key, date, [(player_key, position)])
+            move = {"player_key": player_key, "position": position}
+            if response is None:
+                result["failed"].append(move)
+            else:
+                result["applied"].append(move)
+        result["success"] = bool(result["applied"]) and not result["failed"]
+        result["partial_success"] = bool(result["applied"]) and bool(result["failed"])
+        return result
     
     def add_drop_players(self, league_key, team_key, add_player_key, drop_player_key, faab_bid=None):
         """
