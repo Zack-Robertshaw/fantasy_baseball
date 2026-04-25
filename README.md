@@ -18,8 +18,10 @@ pip install -r requirements.txt
 
 1. Go to [developer.yahoo.com/apps/create](https://developer.yahoo.com/apps/create/)
 2. Create a **Web Application** with **Fantasy Sports Read/Write** permissions
-3. Set the redirect URI to `http://localhost:8000/auth/callback`
-4. Copy your **Client ID** and **Client Secret**
+3. Expose your local app through a public HTTPS tunnel, such as ngrok, Cloudflare Tunnel, or another tunneling service
+4. Set the Yahoo redirect URI to your public tunnel callback URL, for example `https://your-ngrok-domain.ngrok-free.app/auth/callback`
+5. Keep the tunnel running while authenticating so Yahoo can reach your local `/auth/callback` endpoint
+6. Copy your **Client ID** and **Client Secret**
 
 ### 3. Configure environment variables
 
@@ -32,7 +34,7 @@ Edit `.env` with your credentials:
 ```text
 YAHOO_CLIENT_ID=your_client_id_here
 YAHOO_CLIENT_SECRET=your_client_secret_here
-YAHOO_REDIRECT_URI=http://localhost:8000/auth/callback
+YAHOO_REDIRECT_URI=https://your-public-tunnel.example/auth/callback
 ROBOT_LEAGUE_KEY=469.l.12479
 LHF_LEAGUE_KEY=469.l.15622
 LOCAL_TEAM_PROFILES=Robot League|469.l.12479|469.l.12479.t.7;Second League|469.l.15622|469.l.15622.t.4
@@ -53,6 +55,8 @@ NOTIFY_ON_NO_CHANGES=false
 ```
 
 `LOCAL_TEAM_PROFILES` is the easiest way to save multiple local Yahoo teams in the browser UI. Each entry uses `Label|league_key|team_key`, separated by semicolons. The older `ROBOT_LEAGUE_KEY` and optional `LHF_LEAGUE_KEY` values still work as a fallback for league-level configuration.
+
+`YAHOO_REDIRECT_URI` must exactly match the callback URL configured in your Yahoo developer app. Yahoo needs a public HTTPS URL for OAuth callbacks, so run a tunnel to your local server and use the tunnel's `/auth/callback` URL here. For example, if ngrok gives you `https://abcd-1234.ngrok-free.app`, set `YAHOO_REDIRECT_URI=https://abcd-1234.ngrok-free.app/auth/callback`.
 
 `LINEUP_*` settings control the daily lineup optimizer for pitchers and batters. If `LINEUP_TEAM_KEY` is blank, no scheduled job runs. When the scheduler is enabled, it will run for all saved or auto-discovered local teams when available, and otherwise falls back to the legacy single `LINEUP_TEAM_KEY` target. `LINEUP_SCHEDULE_TIMES` accepts a comma-separated list of 24-hour `HH:MM` values in `LINEUP_SCHEDULE_TZ`, so you can run the optimizer more than once per day.
 
@@ -218,7 +222,7 @@ fantasy_baseball/
 ## Troubleshooting
 
 **"Invalid redirect URI"**  
-The URI in your Yahoo developer app must exactly match `YAHOO_REDIRECT_URI` in `.env`. For local dev, use `http://localhost:8000/auth/callback`.
+The URI in your Yahoo developer app must exactly match `YAHOO_REDIRECT_URI` in `.env`. For local dev, this should be the public HTTPS tunnel callback URL, such as `https://abcd-1234.ngrok-free.app/auth/callback`, not `http://localhost:8000/auth/callback`.
 
 **"Not authenticated" errors**  
 Tokens may have expired. Visit [http://localhost:8000](http://localhost:8000) and reconnect Yahoo, or run `./start.sh` if the refresh token is also stale.
