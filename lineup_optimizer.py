@@ -128,20 +128,16 @@ def get_optimal_lineup_changes(
         for player in starting_today
         if _normalize_position(player.get("selected_position")) == BENCH_SLOT
     ]
-    not_starting_active = [
+    active_sp_slot_players = [
         player
         for player in sps
-        if player.get("is_starting") is not True
-        and _normalize_position(player.get("selected_position")) in SP_POSITIONS
+        if _normalize_position(player.get("selected_position")) in SP_POSITIONS
     ]
 
     slot_inventory = _starting_pitcher_slots(api, team_key, players)
-    benched_player_keys = {player["player_key"] for player in not_starting_active}
     occupied_slots = [
         _normalize_position(player.get("selected_position"))
-        for player in players
-        if player.get("player_key") not in benched_player_keys
-        and _normalize_position(player.get("selected_position")) in SP_POSITIONS
+        for player in active_sp_slot_players
     ]
 
     remaining_occupied = list(occupied_slots)
@@ -154,22 +150,37 @@ def get_optimal_lineup_changes(
 
     changes = []
     details = []
+    swap_candidates = list(active_sp_slot_players)
 
-    for p in not_starting_active:
-        current_slot = _normalize_position(p.get("selected_position")) or "SP"
-        changes.append((p["player_key"], BENCH_SLOT))
-        details.append(
-            {
-                "action": "bench",
-                "player_key": p["player_key"],
-                "player": p["name"],
-                "from": current_slot,
-                "to": BENCH_SLOT,
-                "reason": "Not starting today",
-            }
-        )
+    for p in starting_on_bench:
+        if available_slots:
+            target_slot = available_slots.pop(0)
+        else:
+            swap_candidate = next(
+                (
+                    player
+                    for player in swap_candidates
+                    if player.get("is_starting") is not True
+                ),
+                swap_candidates[0] if swap_candidates else None,
+            )
+            if not swap_candidate:
+                continue
 
-    for p, target_slot in zip(starting_on_bench, available_slots):
+            target_slot = _normalize_position(swap_candidate.get("selected_position")) or "SP"
+            changes.append((swap_candidate["player_key"], BENCH_SLOT))
+            details.append(
+                {
+                    "action": "swap_to_bench",
+                    "player_key": swap_candidate["player_key"],
+                    "player": swap_candidate["name"],
+                    "from": target_slot,
+                    "to": BENCH_SLOT,
+                    "reason": f"Opening {target_slot} for starting pitcher",
+                }
+            )
+            swap_candidates.remove(swap_candidate)
+
         changes.append((p["player_key"], target_slot))
         details.append(
             {
