@@ -362,8 +362,8 @@ def get_optimal_batting_lineup_changes(
     api: YahooFantasyAPI,
     team_key: str,
     date: Optional[str] = None,
-    weight_7d: float = 0.6,
-    weight_30d: float = 0.4,
+    weight_7d: float = 0.65,
+    weight_30d: float = 0.35,
 ) -> tuple[list[tuple[str, str]], list[dict], dict]:
     """
     Compute batting-only lineup changes based on a weighted 7d/30d Yahoo rank.
@@ -482,8 +482,8 @@ def optimize_batting_lineup(
     team_key: str,
     date: Optional[str] = None,
     dry_run: bool = True,
-    weight_7d: float = 0.6,
-    weight_30d: float = 0.4,
+    weight_7d: float = 0.65,
+    weight_30d: float = 0.35,
 ) -> dict:
     """
     Optimize batter slots and optionally apply the resulting Yahoo roster updates.
