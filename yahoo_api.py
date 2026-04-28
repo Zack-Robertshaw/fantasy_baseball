@@ -788,12 +788,14 @@ class YahooFantasyAPI:
                 players.append(parsed)
         return players
 
-    def get_team_roster_stats(self, team_key, date=None, stat_type="lastweek") -> list[dict]:
+    def get_team_roster_stats(self, team_key, date=None, stat_type="lastweek", season=None) -> list[dict]:
         """Return parsed roster players enriched with Yahoo stat window data."""
         endpoint = f'/team/{team_key}/roster'
         if date:
             endpoint += f';date={date}'
         endpoint += f'/players/stats;type={stat_type}'
+        if season:
+            endpoint += f';season={season}'
         result = self.make_api_request(endpoint)
         if not result:
             return []

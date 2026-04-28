@@ -36,10 +36,26 @@ def _result_change_count(entry: dict) -> int:
         return 0
 
 
+def _trend_alerts_for_entry(entry: dict) -> list[dict]:
+    result = entry.get("result") or {}
+    batter_summary = result.get("batter_summary") or {}
+    return list(batter_summary.get("trend_alerts") or [])
+
+
+def _total_trend_alert_count(results: list[dict]) -> int:
+    return sum(len(_trend_alerts_for_entry(entry)) for entry in results)
+
+
+def _has_any_trend_alerts(results: list[dict]) -> bool:
+    return any(_trend_alerts_for_entry(entry) for entry in results)
+
+
 def should_notify_optimization_results(results: list[dict]) -> bool:
     if not results:
         return False
     if _env_bool("NOTIFY_ON_NO_CHANGES", False):
+        return True
+    if _env_bool("NOTIFY_ON_TREND_ALERTS", False) and _has_any_trend_alerts(results):
         return True
     return any(
         _result_change_count(entry) > 0 or (entry.get("result") or {}).get("error")
@@ -114,6 +130,86 @@ def _move_rows(entry: dict, section: str, details: list[dict], dry_run: bool) ->
     return rows
 
 
+def _trend_cell(value: object) -> str:
+    if value is None:
+        return "—"
+    return html.escape(str(value))
+
+
+def _plain_signal(alert: dict) -> str:
+    action = alert.get("diagnostic_action")
+    if action:
+        return str(action)
+    signal = str(alert.get("signal") or "")
+    labels = {
+        "drop_or_trade_candidate": "Drop or trade",
+        "sell_high_candidate": "Sell high",
+        "hold_or_buy_candidate": "Hold or buy",
+        "drop_candidate": "Drop candidate",
+        "trade_away_candidate": "Trade away",
+    }
+    return labels.get(signal, signal or "Review")
+
+
+def _trend_alert_row_cells(entry: dict, alert: dict) -> str:
+    league = html.escape(_entry_league(entry))
+    label = html.escape(_entry_label(entry))
+    return (
+        "<tr>"
+        f"<td>{league}</td>"
+        f"<td>{label}</td>"
+        f"<td>{html.escape(str(alert.get('player') or 'Unknown'))}</td>"
+        f"<td>{html.escape(_plain_signal(alert))}</td>"
+        f"<td>{_trend_cell(alert.get('diagnostic_label'))}</td>"
+        f"<td>{_trend_cell(alert.get('wpe_score') if alert.get('wpe_score') is not None else alert.get('composite_score'))}</td>"
+        f"<td>{_trend_cell(alert.get('score_25'))}</td>"
+        f"<td>{_trend_cell(alert.get('score_26'))}</td>"
+        f"<td>{_trend_cell(alert.get('score_30d'))}</td>"
+        f"<td>{_trend_cell(alert.get('score_7d'))}</td>"
+        f"<td>{_trend_cell(alert.get('at_bats_7d'))}</td>"
+        f"<td>{html.escape(str(alert.get('reason') or ''))}</td>"
+        "</tr>"
+    )
+
+
+def _trend_alerts_table_html(results: list[dict], max_rows: int) -> tuple[str, list[str]]:
+    """
+    One combined table of roster trend alerts (per team, at most max_rows each).
+    Returns (html_fragment, per_team_truncation_messages).
+    """
+    row_html: list[str] = []
+    truncate_notes: list[str] = []
+    for entry in results:
+        full = _trend_alerts_for_entry(entry)
+        shown = full[: max(0, max_rows)]
+        for alert in shown:
+            row_html.append(_trend_alert_row_cells(entry, alert))
+        if len(full) > max_rows:
+            truncate_notes.append(
+                f"Showing {max_rows} of {len(full)} trend alerts for {_entry_label(entry)}."
+            )
+
+    if not row_html:
+        return "<p>No roster trend alerts.</p>", []
+
+    table = (
+        "<h2>Roster trend alerts</h2>"
+        "<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">"
+        "<thead><tr>"
+        "<th>League</th><th>Team</th><th>Player</th><th>Recommended action</th>"
+        "<th>Player status</th><th>Start score</th><th>2025 baseline</th>"
+        "<th>This season</th><th>Last 30 days</th><th>Last 7 days</th>"
+        "<th>At-bats last 7 days</th><th>Why this matters</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(row_html)}</tbody>"
+        "</table>"
+    )
+    if truncate_notes:
+        notes = "<p><em>" + html.escape(" ".join(truncate_notes)) + "</em></p>"
+        return table + notes, truncate_notes
+    return table, []
+
+
 def _format_team_section(entry: dict) -> str:
     result = entry.get("result") or {}
     summary = result.get("summary") or {}
@@ -146,6 +242,8 @@ def _format_team_section(entry: dict) -> str:
 
 def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, str]:
     total_changes = sum(_result_change_count(entry) for entry in results)
+    trend_total = _total_trend_alert_count(results)
+    subject_suffix = f", trend alerts: {trend_total}" if trend_total > 0 else ""
     errors = [entry for entry in results if (entry.get("result") or {}).get("error")]
     labels = [_entry_label(entry) for entry in results]
     target = labels[0] if len(labels) == 1 else f"{len(labels)} teams"
@@ -154,10 +252,10 @@ def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, 
     if errors:
         subject = (
             f"Fantasy Lineup: {len(errors)} error(s), "
-            f"{total_changes} changes {action_word} ({target})"
+            f"{total_changes} changes {action_word} ({target}){subject_suffix}"
         )
     else:
-        subject = f"Fantasy Lineup: {total_changes} changes {action_word} ({target})"
+        subject = f"Fantasy Lineup: {total_changes} changes {action_word} ({target}){subject_suffix}"
 
     rows: list[str] = []
     for entry in results:
@@ -180,6 +278,9 @@ def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, 
     else:
         table_html = "<p>No lineup changes were needed.</p>"
 
+    trend_max = _env_int("TREND_ALERT_EMAIL_MAX", 5)
+    trend_table_html, _ = _trend_alerts_table_html(results, max_rows=trend_max)
+
     mode = "Dry run" if dry_run else "Auto apply"
     body = (
         "<html><body>"
@@ -187,6 +288,7 @@ def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, 
         f"<p><strong>Mode:</strong> {mode}</p>"
         f"{''.join(_format_team_section(entry) for entry in results)}"
         f"{table_html}"
+        f"{trend_table_html}"
         "</body></html>"
     )
     return subject, body
