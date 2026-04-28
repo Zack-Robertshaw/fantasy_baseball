@@ -42,6 +42,7 @@ LINEUP_TEAM_KEY=469.l.12479.t.7
 LINEUP_LEAGUE_KEY=469.l.12479
 LINEUP_SCHEDULE_TIMES=11:00,17:00
 LINEUP_SCHEDULE_TZ=US/Eastern
+LINEUP_REST_SLOTS_BATTERS_ONLY=false
 LINEUP_AUTO_APPLY=false
 LINEUP_WEIGHT_7D=0.6
 LINEUP_WEIGHT_30D=0.4
@@ -58,7 +59,7 @@ NOTIFY_ON_NO_CHANGES=false
 
 `YAHOO_REDIRECT_URI` must exactly match the callback URL configured in your Yahoo developer app. Yahoo needs a public HTTPS URL for OAuth callbacks, so run a tunnel to your local server and use the tunnel's `/auth/callback` URL here. For example, if ngrok gives you `https://abcd-1234.ngrok-free.app`, set `YAHOO_REDIRECT_URI=https://abcd-1234.ngrok-free.app/auth/callback`.
 
-`LINEUP_*` settings control the daily lineup optimizer for pitchers and batters. If `LINEUP_TEAM_KEY` is blank, no scheduled job runs. When the scheduler is enabled, it will run for all saved or auto-discovered local teams when available, and otherwise falls back to the legacy single `LINEUP_TEAM_KEY` target. `LINEUP_SCHEDULE_TIMES` accepts a comma-separated list of 24-hour `HH:MM` values in `LINEUP_SCHEDULE_TZ`, so you can run the optimizer more than once per day.
+`LINEUP_*` settings control the daily lineup optimizer for pitchers and batters. If `LINEUP_TEAM_KEY` is blank, no scheduled job runs. When the scheduler is enabled, it will run for all saved or auto-discovered local teams when available, and otherwise falls back to the legacy single `LINEUP_TEAM_KEY` target. `LINEUP_SCHEDULE_TIMES` accepts a comma-separated list of 24-hour `HH:MM` values in `LINEUP_SCHEDULE_TZ`, so you can run the optimizer more than once per day. Set `LINEUP_REST_SLOTS_BATTERS_ONLY=true` to run starting-pitcher / SP slot logic only on the **first** listed time; later times still run batter optimization only (default `false` keeps a full pitcher plus batter pass at every scheduled time).
 
 `NOTIFY_EMAIL_*` / `SMTP_*` settings enable email summaries for scheduled runs. The app sends one email after each scheduled run when at least one team has lineup changes or an error. Set `NOTIFY_ON_NO_CHANGES=true` if you also want an email when no changes are needed. For Gmail, use `smtp.gmail.com`, port `587`, your Gmail address as `SMTP_USER`, and a Google App Password as `SMTP_PASSWORD`.
 
@@ -269,6 +270,7 @@ LINEUP_TEAM_KEY=469.l.12479.t.7
 LINEUP_LEAGUE_KEY=469.l.12479
 LINEUP_SCHEDULE_TIMES=11:00,17:00
 LINEUP_SCHEDULE_TZ=US/Eastern
+LINEUP_REST_SLOTS_BATTERS_ONLY=false
 LINEUP_AUTO_APPLY=true
 LINEUP_WEIGHT_7D=0.6
 LINEUP_WEIGHT_30D=0.4
@@ -283,7 +285,7 @@ NOTIFY_ON_NO_CHANGES=false
 
 `LINEUP_TEAM_KEY` still acts as the scheduler enable switch. Once it is set, the Pi scheduler will prefer all saved or auto-discovered local teams and run each one on the configured times. If discovery is unavailable, it falls back to the single `LINEUP_TEAM_KEY`.
 
-The scheduler also supports the older single-run `LINEUP_SCHEDULE_HOUR` and `LINEUP_SCHEDULE_MINUTE` vars for backward compatibility, but `LINEUP_SCHEDULE_TIMES` is the preferred format for the Pi deployment.
+The scheduler also supports the older single-run `LINEUP_SCHEDULE_HOUR` and `LINEUP_SCHEDULE_MINUTE` vars for backward compatibility, but `LINEUP_SCHEDULE_TIMES` is the preferred format for the Pi deployment. Use `LINEUP_REST_SLOTS_BATTERS_ONLY=true` on the Pi when you want the first daily run to include pitchers and every subsequent run to refresh batters only.
 
 Email notifications use Python's built-in SMTP support, so there are no extra dependencies. If you use Gmail, enable 2-Step Verification on the Google account, create an App Password, and use that app password for `SMTP_PASSWORD`; your normal Google password will not work.
 
