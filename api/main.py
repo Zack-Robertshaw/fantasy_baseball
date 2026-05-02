@@ -215,20 +215,18 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _lineup_weights() -> tuple[float, float]:
-    try:
-        weight_7d = float(os.getenv("LINEUP_WEIGHT_7D", "0.65"))
-    except ValueError:
-        weight_7d = 0.65
-    try:
-        weight_30d = float(os.getenv("LINEUP_WEIGHT_30D", "0.35"))
-    except ValueError:
-        weight_30d = 0.35
+def _lineup_weights() -> tuple[float | None, float | None]:
+    def parse_weight(name: str) -> float | None:
+        raw_value = os.getenv(name)
+        if raw_value is None or raw_value.strip() == "":
+            return None
+        try:
+            return float(raw_value)
+        except ValueError:
+            logger.warning("Ignoring invalid %s value: %s", name, raw_value)
+            return None
 
-    total = weight_7d + weight_30d
-    if total <= 0:
-        return 0.65, 0.35
-    return weight_7d / total, weight_30d / total
+    return parse_weight("LINEUP_WEIGHT_7D"), parse_weight("LINEUP_WEIGHT_30D")
 
 
 def _scheduled_today(tz_name: str) -> str:
@@ -334,8 +332,8 @@ def _run_combined_optimization(
     team_key: str,
     date: str | None = None,
     dry_run: bool = True,
-    weight_7d: float = 0.65,
-    weight_30d: float = 0.35,
+    weight_7d: float | None = None,
+    weight_30d: float | None = None,
     include_pitchers: bool = True,
 ) -> dict:
     roster_date = date or datetime.now().strftime("%Y-%m-%d")

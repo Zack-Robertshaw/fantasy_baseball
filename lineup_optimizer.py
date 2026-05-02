@@ -128,16 +128,16 @@ def get_optimal_lineup_changes(
         for player in starting_today
         if _normalize_position(player.get("selected_position")) == BENCH_SLOT
     ]
-    active_sp_slot_players = [
+    active_pitching_slot_players = [
         player
-        for player in sps
+        for player in players
         if _normalize_position(player.get("selected_position")) in SP_POSITIONS
     ]
 
     slot_inventory = _starting_pitcher_slots(api, team_key, players)
     occupied_slots = [
         _normalize_position(player.get("selected_position"))
-        for player in active_sp_slot_players
+        for player in active_pitching_slot_players
     ]
 
     remaining_occupied = list(occupied_slots)
@@ -150,7 +150,7 @@ def get_optimal_lineup_changes(
 
     changes = []
     details = []
-    swap_candidates = list(active_sp_slot_players)
+    swap_candidates = list(active_pitching_slot_players)
 
     for p in starting_on_bench:
         if available_slots:

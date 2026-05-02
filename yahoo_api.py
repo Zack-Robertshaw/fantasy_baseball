@@ -264,6 +264,81 @@ def _extract_player_core_info(player_obj) -> dict:
     return player_info
 
 
+def _normalize_roster_slot(slot: str | None) -> str:
+    value = str(slot or "").strip()
+    if value.upper() in {"UTIL", "UTIL.", "UTILSLOT", "UTILS"}:
+        return "UTIL"
+    return value.upper()
+
+
+def _order_position_changes(
+    position_changes: list[tuple[str, str]],
+    current_positions: dict[str, str | None],
+) -> list[tuple[str, str]]:
+    """
+    Order individual Yahoo moves so slots are vacated before another player moves in.
+
+    Yahoo applies one-player PUTs against the current roster state. For a chain like
+    C->BN, Util->C, SS->Util, each target slot must be freed before the incoming move.
+    """
+    changes = list(position_changes or [])
+    if len(changes) <= 1:
+        return changes
+
+    outgoing_by_slot: dict[str, list[int]] = {}
+    for index, (player_key, target_slot) in enumerate(changes):
+        current_slot = current_positions.get(player_key)
+        if not current_slot:
+            continue
+        if _normalize_roster_slot(current_slot) == _normalize_roster_slot(target_slot):
+            continue
+        outgoing_by_slot.setdefault(_normalize_roster_slot(current_slot), []).append(index)
+
+    dependencies: dict[int, set[int]] = {index: set() for index in range(len(changes))}
+    dependents: dict[int, set[int]] = {index: set() for index in range(len(changes))}
+    for index, (player_key, target_slot) in enumerate(changes):
+        target_norm = _normalize_roster_slot(target_slot)
+        if target_norm == "BN":
+            continue
+        for outgoing_index in outgoing_by_slot.get(target_norm, []):
+            if outgoing_index == index:
+                continue
+            outgoing_player_key, _ = changes[outgoing_index]
+            if outgoing_player_key == player_key:
+                continue
+            dependencies[index].add(outgoing_index)
+            dependents[outgoing_index].add(index)
+
+    def fallback_key(index: int) -> tuple[int, int]:
+        _, target_slot = changes[index]
+        return (0 if _normalize_roster_slot(target_slot) == "BN" else 1, index)
+
+    ready = sorted(
+        [index for index, prereqs in dependencies.items() if not prereqs],
+        key=fallback_key,
+    )
+    ordered_indices: list[int] = []
+    while ready:
+        index = ready.pop(0)
+        ordered_indices.append(index)
+        for dependent in sorted(dependents[index], key=fallback_key):
+            dependencies[dependent].discard(index)
+            if not dependencies[dependent] and dependent not in ordered_indices and dependent not in ready:
+                ready.append(dependent)
+        ready.sort(key=fallback_key)
+
+    if len(ordered_indices) < len(changes):
+        ordered_set = set(ordered_indices)
+        ordered_indices.extend(
+            sorted(
+                [index for index in range(len(changes)) if index not in ordered_set],
+                key=fallback_key,
+            )
+        )
+
+    return [changes[index] for index in ordered_indices]
+
+
 def _extract_player_stats_map(player_obj) -> dict[str, str]:
     """Extract Yahoo stat_id -> raw value mappings from a player payload."""
     for element in player_obj or []:
@@ -1632,10 +1707,17 @@ class YahooFantasyAPI:
             "applied": [],
             "failed": [],
         }
-        ordered_changes = sorted(
-            position_changes,
-            key=lambda change: 0 if str(change[1]).upper() == "BN" else 1,
-        )
+        current_positions: dict[str, str | None] = {}
+        try:
+            current_positions = {
+                player["player_key"]: player.get("selected_position")
+                for player in self.get_team_roster_details(team_key, date=date)
+                if player.get("player_key")
+            }
+        except Exception as exc:
+            print(f"⚠️  Could not fetch current roster positions for move ordering: {exc}")
+
+        ordered_changes = _order_position_changes(position_changes, current_positions)
         for player_key, position in ordered_changes:
             response = self.edit_roster(team_key, date, [(player_key, position)])
             move = {"player_key": player_key, "position": position}
