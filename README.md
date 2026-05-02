@@ -2,7 +2,7 @@
 
 A Python/FastAPI app for managing Yahoo fantasy baseball rosters with a focused in-season workflow: authenticate with Yahoo, choose from locally configured leagues and teams, inspect rosters, and optimize lineups.
 
-The app will evaluate and update a roster automatically on a schedule. During each scheduled run, it checks the target team's roster for the configured date, identifies starting pitchers from Yahoo's roster-level `is_starting` signal, benches SPs who are not scheduled to start, activates confirmed starters into available `SP` or `P` slots, and then evaluates hitters with a weighted 7-day / 30-day scoring model to fill the best available batting slots. Batters confirmed as not starting by Yahoo (the red X flag) are automatically benched regardless of their composite score. When `LINEUP_AUTO_APPLY=true`, those pitcher and batter moves are written back to Yahoo one player at a time so a single locked or in-game player does not block every other move; when it is `false`, the same evaluation still runs but only logs what would have changed. After each scheduled run, the app sends a combined email summary across all teams when email notifications are enabled.
+The app will evaluate and update a roster automatically on a schedule. During each scheduled run, it checks the target team's roster for the configured date, identifies starting pitchers from Yahoo's roster-level `is_starting` signal, benches SPs who are not scheduled to start, activates confirmed starters into available `SP` or `P` slots, and then evaluates hitters with a four-window weighted performance expectation (WPE) model to fill the best available batting slots. Batters confirmed as not starting by Yahoo (the red X flag) are automatically benched regardless of their WPE score. When `LINEUP_AUTO_APPLY=true`, those pitcher and batter moves are written back to Yahoo one player at a time in dependency order so chained slot moves can free occupied slots before moving another player in; when it is `false`, the same evaluation still runs but only logs what would have changed. After each scheduled run, the app sends a combined email summary across all teams when email notifications are enabled.
 
 ---
 
@@ -44,8 +44,8 @@ LINEUP_SCHEDULE_TIMES=11:00,17:00
 LINEUP_SCHEDULE_TZ=US/Eastern
 LINEUP_REST_SLOTS_BATTERS_ONLY=false
 LINEUP_AUTO_APPLY=false
-LINEUP_WEIGHT_7D=0.6
-LINEUP_WEIGHT_30D=0.4
+LINEUP_WEIGHT_7D=0.50
+LINEUP_WEIGHT_30D=0.35
 NOTIFY_EMAIL_ENABLED=false
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
@@ -155,22 +155,24 @@ The batter optimizer uses real recent Yahoo stat windows rather than Yahoo's opa
 
 For each hitter:
 
-1. Pull `lastweek` and `lastmonth` category stats from Yahoo
+1. Pull Yahoo category stats for `lastweek`, `lastmonth`, current season, and the 2025 season baseline
 2. Normalize each category across roster hitters with z-scores
-3. Sum category z-scores into `score_7d` and `score_30d`
-4. Compute `composite_score = LINEUP_WEIGHT_7D * score_7d + LINEUP_WEIGHT_30D * score_30d`
+3. Sum category z-scores into `score_7d`, `score_30d`, `score_26`, and `score_25`
+4. Compute `wpe_score` with default weights: `0.50 * score_7d + 0.35 * score_30d + 0.15 * score_26 + 0.0 * score_25`
 
-Higher `composite_score` means stronger recent performance for the league format.
+Higher `wpe_score` means stronger expected performance for the league format. `composite_score` is still returned for older UI and email consumers, but it now mirrors `wpe_score`.
+
+`LINEUP_WEIGHT_7D` and `LINEUP_WEIGHT_30D` can override the recent-window weights. If their total is below `1.0`, the remaining weight is assigned to the season/baseline windows using the default proportions.
 
 ### Lineup behavior
 
 - Pitchers are untouched by the batter optimizer
 - Hitters without a scheduled game for the target date are benched
 - Hitters with a game today but confirmed not starting by Yahoo (`is_starting` is `false`) are benched with a distinct reason
-- Hitters whose starting status is unknown (`is_starting` is `null`) remain eligible and are ranked by composite score
-- Remaining active slots are filled with scarcity-first assignment so multi-position hitters do not block thinner positions
+- Hitters whose starting status is unknown (`is_starting` is `null`) remain eligible and are ranked by WPE score
+- Remaining active slots are filled with a global WPE-optimal assignment across all eligible hitters and slots
 - The endpoint accepts an explicit `date`, so future editable dates can be optimized too
-- Roster edits are sent to Yahoo one player at a time so a locked or in-game player only blocks its own move
+- Roster edits are sent to Yahoo one player at a time in dependency order so a locked or in-game player only blocks its own move, and chained slot moves can apply cleanly
 
 ---
 
@@ -272,8 +274,8 @@ LINEUP_SCHEDULE_TIMES=11:00,17:00
 LINEUP_SCHEDULE_TZ=US/Eastern
 LINEUP_REST_SLOTS_BATTERS_ONLY=false
 LINEUP_AUTO_APPLY=true
-LINEUP_WEIGHT_7D=0.6
-LINEUP_WEIGHT_30D=0.4
+LINEUP_WEIGHT_7D=0.50
+LINEUP_WEIGHT_30D=0.35
 NOTIFY_EMAIL_ENABLED=true
 SMTP_HOST=smtp.gmail.com
 SMTP_PORT=587
@@ -337,10 +339,10 @@ Use this as a handoff block for a future chat.
 - `POST /api/optimize-batting-lineup` exists
 - The app is intentionally trimmed to the core in-season workflow
 - Up to two configured leagues are still supported through `ROBOT_LEAGUE_KEY` and optional `LHF_LEAGUE_KEY`
-- The batter optimizer uses Yahoo `lastweek` and `lastmonth` hitter stats plus MLB schedule data
-- The current scoring model is a category-based z-score blend across `R`, `HR`, `RBI`, `SB`, and `AVG`
+- The batter optimizer uses Yahoo recent, season, and baseline hitter stats plus MLB schedule data
+- The current scoring model is a four-window WPE z-score blend across `R`, `HR`, `RBI`, `SB`, and `AVG`
 - Batters confirmed not starting by Yahoo are automatically benched; unknown starting status keeps them eligible
-- Roster edits are sent per-player so one locked player does not block every other move
+- Roster edits are sent per-player in dependency order so one locked player does not block every other move
 - Email notifications send a combined summary with league, team, and per-player Applied/Failed/Preview status
 - Future-date lineup writes work, but Yahoo roster reads can lag briefly after a successful write
 
@@ -358,11 +360,11 @@ Use this as a handoff block for a future chat.
    - opponent
    - score_7d
    - score_30d
-   - composite_score
+   - wpe_score
 4. Add a multi-day preview/apply endpoint, for example `start_date` and `end_date`.
 5. Add tests around:
    - category score calculation
-   - scarcity-first slot assignment
+   - global WPE slot assignment
    - date-specific roster updates
    - benching off-day and confirmed-bench hitters
    - per-player partial apply logic
