@@ -2,7 +2,7 @@
 
 A Python/FastAPI app for managing Yahoo fantasy baseball rosters with a focused in-season workflow: authenticate with Yahoo, choose from locally configured leagues and teams, inspect rosters, and optimize lineups.
 
-The app will evaluate and update a roster automatically on a schedule. During each scheduled run, it checks the target team's roster for the configured date, identifies starting pitchers from Yahoo's roster-level `is_starting` signal, benches SPs who are not scheduled to start, activates confirmed starters into available `SP` or `P` slots, and then evaluates hitters with a four-window weighted performance expectation (WPE) model to fill the best available batting slots. Batters confirmed as not starting by Yahoo (the red X flag) are automatically benched regardless of their WPE score. When `LINEUP_AUTO_APPLY=true`, those pitcher and batter moves are written back to Yahoo one player at a time in dependency order so chained slot moves can free occupied slots before moving another player in; when it is `false`, the same evaluation still runs but only logs what would have changed. After each scheduled run, the app sends a combined email summary across all teams when email notifications are enabled.
+The app will evaluate and update a roster automatically on a schedule. During each scheduled run, it checks the target team's roster for the configured date, identifies starting pitchers from Yahoo's roster-level `is_starting` signal, benches SPs who are not scheduled to start, activates confirmed starters into available `SP` or `P` slots, and then evaluates hitters with a four-window weighted performance expectation (WPE) model to fill the best available batting slots. Batters confirmed as not starting by Yahoo (the red X flag) are automatically benched regardless of their WPE score. When `LINEUP_AUTO_APPLY=true`, those pitcher and batter moves are written back to Yahoo one player at a time in dependency order so chained slot moves can free occupied slots before moving another player in; when it is `false`, the same evaluation still runs but only logs what would have changed. After each scheduled run, the app sends a combined email summary across all teams when email notifications are enabled, including optional waiver-wire target recommendations based on category needs.
 
 ---
 
@@ -53,6 +53,9 @@ SMTP_USER=your_email@gmail.com
 SMTP_PASSWORD=your_app_password_here
 NOTIFY_EMAIL_TO=recipient@example.com
 NOTIFY_ON_NO_CHANGES=false
+WAIVER_ANALYSIS_ENABLED=false
+WAIVER_FA_COUNT=25
+WAIVER_TOP_N=10
 ```
 
 `LOCAL_TEAM_PROFILES` is the easiest way to save multiple local Yahoo teams in the browser UI. Each entry uses `Label|league_key|team_key`, separated by semicolons. The older `ROBOT_LEAGUE_KEY` and optional `LHF_LEAGUE_KEY` values still work as a fallback for league-level configuration.
@@ -61,7 +64,9 @@ NOTIFY_ON_NO_CHANGES=false
 
 `LINEUP_*` settings control the daily lineup optimizer for pitchers and batters. If `LINEUP_TEAM_KEY` is blank, no scheduled job runs. When the scheduler is enabled, it will run for all saved or auto-discovered local teams when available, and otherwise falls back to the legacy single `LINEUP_TEAM_KEY` target. `LINEUP_SCHEDULE_TIMES` accepts a comma-separated list of 24-hour `HH:MM` values in `LINEUP_SCHEDULE_TZ`, so you can run the optimizer more than once per day. Set `LINEUP_REST_SLOTS_BATTERS_ONLY=true` to run starting-pitcher / SP slot logic only on the **first** listed time; later times still run batter optimization only (default `false` keeps a full pitcher plus batter pass at every scheduled time).
 
-`NOTIFY_EMAIL_*` / `SMTP_*` settings enable email summaries for scheduled runs. The app sends one email after each scheduled run when at least one team has lineup changes or an error. Set `NOTIFY_ON_NO_CHANGES=true` if you also want an email when no changes are needed. For Gmail, use `smtp.gmail.com`, port `587`, your Gmail address as `SMTP_USER`, and a Google App Password as `SMTP_PASSWORD`.
+`NOTIFY_EMAIL_*` / `SMTP_*` settings enable email summaries for scheduled runs. The app sends one email after each scheduled run when at least one team has lineup changes, waiver targets, or an error. Set `NOTIFY_ON_NO_CHANGES=true` if you also want an email when no changes are needed. For Gmail, use `smtp.gmail.com`, port `587`, your Gmail address as `SMTP_USER`, and a Google App Password as `SMTP_PASSWORD`.
+
+`WAIVER_*` settings control the optional waiver-wire target section in scheduled emails. When `WAIVER_ANALYSIS_ENABLED=true`, the first scheduled run of the day evaluates available hitters across standard batter positions and includes the top `WAIVER_TOP_N` targets in the email. `WAIVER_FA_COUNT` is the maximum number of free agents fetched per position before deduping.
 
 ### 4. Run the app
 
@@ -100,6 +105,7 @@ Open [http://localhost:8000](http://localhost:8000) and click **Connect Yahoo** 
 - Combined lineup optimization for a selected date
 - Daily scheduled pitcher + batter optimization through APScheduler
 - Email notifications with per-player Applied/Failed/Preview status after each scheduled run
+- Optional waiver-wire target recommendations based on category needs
 
 Tokens are persisted to `yahoo_tokens.json` in the process working directory. With `./dev.sh` or `./start.sh`, that is the `fantasy_baseball/` project root.
 
@@ -176,6 +182,48 @@ Higher `wpe_score` means stronger expected performance for the league format. `c
 
 ---
 
+## Waiver-wire target scoring
+
+The waiver-wire analysis is recommendation-only. It never adds, drops, claims, or watches players in Yahoo. It only adds a **Waiver Wire Suggestions** section to scheduled emails when `WAIVER_ANALYSIS_ENABLED=true`.
+
+### Category need weights
+
+On each run, the app derives your team needs from Yahoo scoreboard history instead of hard-coded or screenshot-provided standings. For each completed matchup week, it aggregates the team's per-category W-L-T results, then converts each category into a weight:
+
+```text
+weight = (losses + 0.5 * ties) / total_matchups
+```
+
+Categories the team has struggled in receive higher weights. Categories the team has been winning receive lower weights. The category list still comes dynamically from Yahoo league settings, so leagues with different batting categories do not need code changes.
+
+### Free-agent pool
+
+The current waiver model is hitter-only. It fetches available players across standard batter positions:
+
+```text
+C, 1B, 2B, 3B, SS, OF
+```
+
+For each position, it asks Yahoo for up to `WAIVER_FA_COUNT` available players, dedupes multi-position players, and excludes:
+
+- pitcher-only players
+- players with roster-only status/eligibility such as `IL`, `NA`, `DL`, `IR`, or `BN`
+
+### Score calculation
+
+Free agents are scored with the same Yahoo stat windows used by the batter optimizer:
+
+- Yahoo `lastweek`
+- Yahoo `lastmonth`
+- current Yahoo season-to-date
+- 2025 season baseline
+
+For each stat window, the app computes z-scores across the fetched free-agent pool, weights those category z-scores by team need, blends the windows with the WPE weights, and ranks the best available targets. The email shows the top `WAIVER_TOP_N` players with their positions, need score, recent-window scores, 7-day at-bats, and the categories they help most.
+
+The waiver section is intentionally decoupled from roster drop suggestions. Roster trend alerts identify current players to monitor; waiver-wire suggestions identify available hitters who best address category needs.
+
+---
+
 ## API endpoints
 
 | Method | Endpoint | Description |
@@ -210,6 +258,7 @@ fantasy_baseball/
 ├── mlb_client.py             # MLB schedule and player data helpers
 ├── lineup_optimizer.py       # SP lineup optimization logic
 ├── batter_optimizer.py       # Daily batter lineup optimization logic
+├── waiver_optimizer.py       # Category-need waiver target recommendations
 ├── notifier.py               # Email notifications for scheduled lineup runs
 ├── yahoo_tokens.json         # OAuth tokens at runtime if cwd is project root (gitignored)
 ├── fantasy-baseball.service  # Example systemd unit for Raspberry Pi deployment
@@ -283,13 +332,16 @@ SMTP_USER=your_email@gmail.com
 SMTP_PASSWORD=your_app_password_here
 NOTIFY_EMAIL_TO=recipient@example.com
 NOTIFY_ON_NO_CHANGES=false
+WAIVER_ANALYSIS_ENABLED=true
+WAIVER_FA_COUNT=25
+WAIVER_TOP_N=10
 ```
 
 `LINEUP_TEAM_KEY` still acts as the scheduler enable switch. Once it is set, the Pi scheduler will prefer all saved or auto-discovered local teams and run each one on the configured times. If discovery is unavailable, it falls back to the single `LINEUP_TEAM_KEY`.
 
 The scheduler also supports the older single-run `LINEUP_SCHEDULE_HOUR` and `LINEUP_SCHEDULE_MINUTE` vars for backward compatibility, but `LINEUP_SCHEDULE_TIMES` is the preferred format for the Pi deployment. Use `LINEUP_REST_SLOTS_BATTERS_ONLY=true` on the Pi when you want the first daily run to include pitchers and every subsequent run to refresh batters only.
 
-Email notifications use Python's built-in SMTP support, so there are no extra dependencies. If you use Gmail, enable 2-Step Verification on the Google account, create an App Password, and use that app password for `SMTP_PASSWORD`; your normal Google password will not work.
+Email notifications use Python's built-in SMTP support, so there are no extra dependencies. If you use Gmail, enable 2-Step Verification on the Google account, create an App Password, and use that app password for `SMTP_PASSWORD`; your normal Google password will not work. Waiver analysis only runs on the first scheduled job of the day so repeated schedule times do not repeatedly scan the free-agent pool.
 
 ### 4. Install the systemd service
 
@@ -342,8 +394,10 @@ Use this as a handoff block for a future chat.
 - The batter optimizer uses Yahoo recent, season, and baseline hitter stats plus MLB schedule data
 - The current scoring model is a four-window WPE z-score blend across `R`, `HR`, `RBI`, `SB`, and `AVG`
 - Batters confirmed not starting by Yahoo are automatically benched; unknown starting status keeps them eligible
+- Trend alerts include a `chronic_underperformer` floor signal for hitters who are consistently bottom-quartile across season and 30-day roster scores
 - Roster edits are sent per-player in dependency order so one locked player does not block every other move
 - Email notifications send a combined summary with league, team, and per-player Applied/Failed/Preview status
+- Optional waiver-wire target recommendations evaluate available hitters against category need weights and are recommendation-only
 - Future-date lineup writes work, but Yahoo roster reads can lag briefly after a successful write
 
 ### Recommended backlog
@@ -351,7 +405,6 @@ Use this as a handoff block for a future chat.
 1. Add post-apply verification with retry/polling so successful Yahoo writes can be confirmed without relying on a manual app refresh.
 2. Add support for more optimizer configuration in `.env`, including:
    - category include/exclude list
-   - per-category weights
    - minimum playing-time threshold
    - optional star-player protection rules
 3. Add a review endpoint that returns a compact hitter table for a target date:
