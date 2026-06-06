@@ -264,6 +264,81 @@ def _extract_player_core_info(player_obj) -> dict:
     return player_info
 
 
+def _normalize_roster_slot(slot: str | None) -> str:
+    value = str(slot or "").strip()
+    if value.upper() in {"UTIL", "UTIL.", "UTILSLOT", "UTILS"}:
+        return "UTIL"
+    return value.upper()
+
+
+def _order_position_changes(
+    position_changes: list[tuple[str, str]],
+    current_positions: dict[str, str | None],
+) -> list[tuple[str, str]]:
+    """
+    Order individual Yahoo moves so slots are vacated before another player moves in.
+
+    Yahoo applies one-player PUTs against the current roster state. For a chain like
+    C->BN, Util->C, SS->Util, each target slot must be freed before the incoming move.
+    """
+    changes = list(position_changes or [])
+    if len(changes) <= 1:
+        return changes
+
+    outgoing_by_slot: dict[str, list[int]] = {}
+    for index, (player_key, target_slot) in enumerate(changes):
+        current_slot = current_positions.get(player_key)
+        if not current_slot:
+            continue
+        if _normalize_roster_slot(current_slot) == _normalize_roster_slot(target_slot):
+            continue
+        outgoing_by_slot.setdefault(_normalize_roster_slot(current_slot), []).append(index)
+
+    dependencies: dict[int, set[int]] = {index: set() for index in range(len(changes))}
+    dependents: dict[int, set[int]] = {index: set() for index in range(len(changes))}
+    for index, (player_key, target_slot) in enumerate(changes):
+        target_norm = _normalize_roster_slot(target_slot)
+        if target_norm == "BN":
+            continue
+        for outgoing_index in outgoing_by_slot.get(target_norm, []):
+            if outgoing_index == index:
+                continue
+            outgoing_player_key, _ = changes[outgoing_index]
+            if outgoing_player_key == player_key:
+                continue
+            dependencies[index].add(outgoing_index)
+            dependents[outgoing_index].add(index)
+
+    def fallback_key(index: int) -> tuple[int, int]:
+        _, target_slot = changes[index]
+        return (0 if _normalize_roster_slot(target_slot) == "BN" else 1, index)
+
+    ready = sorted(
+        [index for index, prereqs in dependencies.items() if not prereqs],
+        key=fallback_key,
+    )
+    ordered_indices: list[int] = []
+    while ready:
+        index = ready.pop(0)
+        ordered_indices.append(index)
+        for dependent in sorted(dependents[index], key=fallback_key):
+            dependencies[dependent].discard(index)
+            if not dependencies[dependent] and dependent not in ordered_indices and dependent not in ready:
+                ready.append(dependent)
+        ready.sort(key=fallback_key)
+
+    if len(ordered_indices) < len(changes):
+        ordered_set = set(ordered_indices)
+        ordered_indices.extend(
+            sorted(
+                [index for index in range(len(changes)) if index not in ordered_set],
+                key=fallback_key,
+            )
+        )
+
+    return [changes[index] for index in ordered_indices]
+
+
 def _extract_player_stats_map(player_obj) -> dict[str, str]:
     """Extract Yahoo stat_id -> raw value mappings from a player payload."""
     for element in player_obj or []:
@@ -788,12 +863,14 @@ class YahooFantasyAPI:
                 players.append(parsed)
         return players
 
-    def get_team_roster_stats(self, team_key, date=None, stat_type="lastweek") -> list[dict]:
+    def get_team_roster_stats(self, team_key, date=None, stat_type="lastweek", season=None) -> list[dict]:
         """Return parsed roster players enriched with Yahoo stat window data."""
         endpoint = f'/team/{team_key}/roster'
         if date:
             endpoint += f';date={date}'
         endpoint += f'/players/stats;type={stat_type}'
+        if season:
+            endpoint += f';season={season}'
         result = self.make_api_request(endpoint)
         if not result:
             return []
@@ -1240,6 +1317,186 @@ class YahooFantasyAPI:
         except (KeyError, TypeError):
             return None
 
+    def get_league_free_agents(self, league_key, positions=None, count_per_position=25) -> list[dict]:
+        """
+        Return available players, optionally restricted to one or more batting positions.
+
+        Yahoo treats status=A as all available players. When positions are supplied, this
+        makes one small position-filtered request per position and deduplicates players.
+        """
+        normalized_positions = {
+            str(position).strip().upper()
+            for position in (positions or [])
+            if str(position or "").strip()
+        }
+        if not normalized_positions:
+            normalized_positions = {None}
+
+        by_player_key: dict[str, dict] = {}
+        for position in sorted(normalized_positions, key=lambda item: item or ""):
+            players = self.get_league_players(
+                league_key,
+                status="A",
+                position=position,
+                sort="AR",
+                sort_type="season",
+                count=count_per_position,
+            ) or []
+            for player in players:
+                player_key = player.get("player_key")
+                if player_key and player_key not in by_player_key:
+                    by_player_key[player_key] = player
+        return list(by_player_key.values())
+
+    def get_free_agent_stats(
+        self,
+        league_key,
+        player_keys,
+        stat_type="lastweek",
+        season=None,
+    ) -> list[dict]:
+        """Return available-player stats for specific player keys."""
+        keys = [str(key).strip() for key in player_keys or [] if str(key or "").strip()]
+        if not keys:
+            return []
+
+        players: list[dict] = []
+        batch_size = 25
+        for start in range(0, len(keys), batch_size):
+            batch = ",".join(keys[start:start + batch_size])
+            endpoint = f'/league/{league_key}/players;player_keys={batch}/stats;type={stat_type}'
+            if season:
+                endpoint += f';season={season}'
+            result = self.make_api_request(endpoint)
+            if not result:
+                continue
+
+            try:
+                league_data = result.get('fantasy_content', {}).get('league', [{}])
+                if isinstance(league_data, list) and len(league_data) > 1:
+                    players_data = league_data[1].get('players', {})
+                else:
+                    players_data = league_data.get('players', {}) if isinstance(league_data, dict) else {}
+            except (KeyError, TypeError, IndexError):
+                continue
+
+            players.extend(self._parse_players_collection_with_stats(players_data, stat_type))
+        return players
+
+    def _parse_players_collection_with_stats(self, players_data, stat_type) -> list[dict]:
+        """Parse a Yahoo players collection into player dicts enriched with stats_map."""
+        players = []
+        if not players_data:
+            return players
+
+        for key, val in players_data.items():
+            if not key.isdigit():
+                continue
+            player_obj = val.get('player', [{}])
+            if not player_obj:
+                continue
+
+            player_info = _extract_player_core_info(player_obj)
+            if player_info['player_key']:
+                player_info["stats_map"] = _extract_player_stats_map(player_obj)
+                player_info["stat_type"] = stat_type
+                players.append(player_info)
+        return players
+
+    def get_team_category_records(self, league_key, team_key) -> dict:
+        """
+        Aggregate this team's per-category W-L-T record across completed matchup weeks.
+        """
+        current_week = self._league_current_week(league_key)
+        if current_week <= 1:
+            return {}
+
+        settings = self.get_league_scoring_settings(league_key) or {}
+        stat_names_by_id = {
+            str(row.get("stat_id")): row.get("name")
+            for group in (settings.get("batting_categories") or [], settings.get("pitching_categories") or [])
+            for row in group
+            if isinstance(row, dict) and row.get("stat_id")
+        }
+        records: dict[str, dict[str, int]] = {}
+        for week in range(1, current_week):
+            result = self.make_api_request(f'/league/{league_key}/scoreboard;week={week}')
+            if not result:
+                continue
+            for row in self._team_category_results_from_scoreboard(result, team_key, stat_names_by_id):
+                category = str(row.get("category") or row.get("stat_id") or "").strip()
+                outcome = str(row.get("outcome") or "").upper()
+                if not category or outcome not in {"W", "L", "T"}:
+                    continue
+                record = records.setdefault(category, {"W": 0, "L": 0, "T": 0})
+                record[outcome] += 1
+        return records
+
+    def _league_current_week(self, league_key) -> int:
+        info = self.get_league_info(league_key) or {}
+        for key in ("current_week", "end_week"):
+            try:
+                value = int(info.get(key) or 0)
+            except (TypeError, ValueError):
+                value = 0
+            if value > 0:
+                return value
+        return 1
+
+    def _team_category_results_from_scoreboard(
+        self,
+        result: dict,
+        team_key: str,
+        stat_names_by_id: dict[str, str],
+    ) -> list[dict]:
+        rows: list[dict] = []
+
+        def contains_team(obj) -> bool:
+            if isinstance(obj, dict):
+                if obj.get("team_key") == team_key:
+                    return True
+                return any(contains_team(value) for value in obj.values())
+            if isinstance(obj, list):
+                return any(contains_team(value) for value in obj)
+            return False
+
+        def collect_stat_winners(obj) -> None:
+            if isinstance(obj, dict):
+                stat_winner = obj.get("stat_winner")
+                if isinstance(stat_winner, dict):
+                    stat_id = str(stat_winner.get("stat_id") or "")
+                    winner_team_key = str(stat_winner.get("winner_team_key") or "")
+                    is_tied = stat_winner.get("is_tied") in {1, "1", True, "true"}
+                    if stat_id and (is_tied or winner_team_key):
+                        outcome = "T" if is_tied else ("W" if winner_team_key == team_key else "L")
+                        rows.append(
+                            {
+                                "stat_id": stat_id,
+                                "category": stat_names_by_id.get(stat_id, stat_id),
+                                "outcome": outcome,
+                            }
+                        )
+                for value in obj.values():
+                    collect_stat_winners(value)
+            elif isinstance(obj, list):
+                for value in obj:
+                    collect_stat_winners(value)
+
+        def walk_matchups(obj) -> None:
+            if isinstance(obj, dict):
+                matchup = obj.get("matchup")
+                if isinstance(matchup, (dict, list)) and contains_team(matchup):
+                    collect_stat_winners(matchup)
+                    return
+                for value in obj.values():
+                    walk_matchups(value)
+            elif isinstance(obj, list):
+                for value in obj:
+                    walk_matchups(value)
+
+        walk_matchups(result.get('fantasy_content', {}))
+        return rows
+
     def get_roster_with_rankings(self, team_key, league_key, date=None, sort_type='lastweek', count=400):
         """
         Return the team's roster enriched with Yahoo ranks for the requested sort window.
@@ -1630,10 +1887,17 @@ class YahooFantasyAPI:
             "applied": [],
             "failed": [],
         }
-        ordered_changes = sorted(
-            position_changes,
-            key=lambda change: 0 if str(change[1]).upper() == "BN" else 1,
-        )
+        current_positions: dict[str, str | None] = {}
+        try:
+            current_positions = {
+                player["player_key"]: player.get("selected_position")
+                for player in self.get_team_roster_details(team_key, date=date)
+                if player.get("player_key")
+            }
+        except Exception as exc:
+            print(f"⚠️  Could not fetch current roster positions for move ordering: {exc}")
+
+        ordered_changes = _order_position_changes(position_changes, current_positions)
         for player_key, position in ordered_changes:
             response = self.edit_roster(team_key, date, [(player_key, position)])
             move = {"player_key": player_key, "position": position}

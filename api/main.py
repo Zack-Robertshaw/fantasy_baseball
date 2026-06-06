@@ -6,6 +6,7 @@ import logging
 import os
 import sys
 from datetime import datetime
+from functools import partial
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -19,13 +20,14 @@ from pydantic import BaseModel
 # Import from parent package - run with: uvicorn api.main:app --reload (from fantasy_baseball dir)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from batter_optimizer import optimize_batting_lineup
+from batter_optimizer import evaluate_roster_trends, optimize_batting_lineup
 from lineup_optimizer import _parse_roster_player, optimize_lineup
 from notifier import (
     format_optimization_email,
     send_notification,
     should_notify_optimization_results,
 )
+from waiver_optimizer import get_add_drop_suggestions
 from yahoo_api import YahooFantasyAPI
 
 logger = logging.getLogger(__name__)
@@ -214,20 +216,26 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _lineup_weights() -> tuple[float, float]:
+def _env_int(name: str, default: int) -> int:
     try:
-        weight_7d = float(os.getenv("LINEUP_WEIGHT_7D", "0.6"))
+        return int(os.getenv(name, "").strip() or default)
     except ValueError:
-        weight_7d = 0.6
-    try:
-        weight_30d = float(os.getenv("LINEUP_WEIGHT_30D", "0.4"))
-    except ValueError:
-        weight_30d = 0.4
+        logger.warning("Ignoring invalid %s value: %s", name, os.getenv(name))
+        return default
 
-    total = weight_7d + weight_30d
-    if total <= 0:
-        return 0.6, 0.4
-    return weight_7d / total, weight_30d / total
+
+def _lineup_weights() -> tuple[float | None, float | None]:
+    def parse_weight(name: str) -> float | None:
+        raw_value = os.getenv(name)
+        if raw_value is None or raw_value.strip() == "":
+            return None
+        try:
+            return float(raw_value)
+        except ValueError:
+            logger.warning("Ignoring invalid %s value: %s", name, raw_value)
+            return None
+
+    return parse_weight("LINEUP_WEIGHT_7D"), parse_weight("LINEUP_WEIGHT_30D")
 
 
 def _scheduled_today(tz_name: str) -> str:
@@ -317,16 +325,31 @@ def _league_label(league_key: str | None) -> str:
     return league_key
 
 
+def _empty_pitcher_optimization_result() -> dict:
+    """Shape aligned with optimize_lineup return for combined-result merging."""
+    return {
+        "changes": [],
+        "details": [],
+        "applied": False,
+        "apply_result": None,
+        "error": None,
+    }
+
+
 def _run_combined_optimization(
     api: YahooFantasyAPI,
     team_key: str,
     date: str | None = None,
     dry_run: bool = True,
-    weight_7d: float = 0.6,
-    weight_30d: float = 0.4,
+    weight_7d: float | None = None,
+    weight_30d: float | None = None,
+    include_pitchers: bool = True,
 ) -> dict:
     roster_date = date or datetime.now().strftime("%Y-%m-%d")
-    pitcher_result = optimize_lineup(api, team_key, date=roster_date, dry_run=dry_run)
+    if include_pitchers:
+        pitcher_result = optimize_lineup(api, team_key, date=roster_date, dry_run=dry_run)
+    else:
+        pitcher_result = _empty_pitcher_optimization_result()
     batter_result = optimize_batting_lineup(
         api,
         team_key,
@@ -383,10 +406,16 @@ def _run_combined_optimization(
     }
 
 
-def _run_scheduled_optimization() -> None:
+def _run_scheduled_optimization(
+    include_pitchers: bool = True,
+    include_waiver_analysis: bool = True,
+) -> None:
     timezone_name = os.getenv("LINEUP_SCHEDULE_TZ", "US/Eastern")
     auto_apply = _env_bool("LINEUP_AUTO_APPLY", False)
     weight_7d, weight_30d = _lineup_weights()
+    waiver_enabled = _env_bool("WAIVER_ANALYSIS_ENABLED", False) and include_waiver_analysis
+    waiver_fa_count = _env_int("WAIVER_FA_COUNT", 25)
+    waiver_top_n = _env_int("WAIVER_TOP_N", 10)
 
     try:
         api = _get_api()
@@ -405,12 +434,33 @@ def _run_scheduled_optimization() -> None:
                 dry_run=not auto_apply,
                 weight_7d=weight_7d,
                 weight_30d=weight_30d,
+                include_pitchers=include_pitchers,
             )
+            if waiver_enabled:
+                try:
+                    result["waiver_suggestions"] = get_add_drop_suggestions(
+                        api,
+                        team_key,
+                        date=roster_date,
+                        fa_count_per_position=waiver_fa_count,
+                        top_n=waiver_top_n,
+                        weight_7d=weight_7d,
+                        weight_30d=weight_30d,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Waiver analysis failed: team=%s label=%s",
+                        team_key,
+                        profile.get("label"),
+                    )
+                    result["waiver_error"] = str(exc)
             logger.info(
-                "Scheduled lineup optimization finished: team=%s label=%s dry_run=%s pitcher_changes=%d batter_changes=%d total_changes=%d error=%s",
+                "Scheduled lineup optimization finished: team=%s label=%s dry_run=%s include_pitchers=%s waiver_enabled=%s pitcher_changes=%d batter_changes=%d total_changes=%d error=%s",
                 team_key,
                 profile.get("label"),
                 not auto_apply,
+                include_pitchers,
+                waiver_enabled,
                 len(result.get("pitcher_changes") or []),
                 len(result.get("batter_changes") or []),
                 (result.get("summary") or {}).get("total_changes_count", 0),
@@ -692,6 +742,27 @@ def optimize_batting_lineup_post(
     )
 
 
+@app.get("/api/roster/trends")
+def roster_trends_get(
+    team_key: str = Query(...),
+    date: str | None = None,
+):
+    """Evaluate roster batter trends without applying lineup changes."""
+    api = _get_api()
+    if not api._ensure_valid_token():
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    weight_7d, weight_30d = _lineup_weights()
+    roster_date = date or datetime.now().strftime("%Y-%m-%d")
+    return evaluate_roster_trends(
+        api,
+        team_key,
+        date=roster_date,
+        weight_7d=weight_7d,
+        weight_30d=weight_30d,
+    )
+
+
 @app.post("/api/optimize-all-lineups")
 def optimize_all_lineups_post(
     date: str | None = None,
@@ -744,10 +815,17 @@ def startup_scheduler() -> None:
     timezone_name = os.getenv("LINEUP_SCHEDULE_TZ", "US/Eastern")
     schedule_times = _lineup_schedule_times()
 
+    rest_slots_batters_only = _env_bool("LINEUP_REST_SLOTS_BATTERS_ONLY", False)
     _scheduler = BackgroundScheduler(timezone=timezone_name)
     for index, (hour, minute) in enumerate(schedule_times):
-        _scheduler.add_job(
+        include_pitchers = (not rest_slots_batters_only) or (index == 0)
+        job = partial(
             _run_scheduled_optimization,
+            include_pitchers=include_pitchers,
+            include_waiver_analysis=(index == 0),
+        )
+        _scheduler.add_job(
+            job,
             trigger="cron",
             hour=hour,
             minute=minute,
@@ -757,10 +835,11 @@ def startup_scheduler() -> None:
     _scheduler.start()
     schedule_labels = ", ".join(f"{hour:02d}:{minute:02d}" for hour, minute in schedule_times)
     logger.info(
-        "Started daily lineup optimization scheduler for team=%s at %s %s",
+        "Started daily lineup optimization scheduler for team=%s at %s %s (LINEUP_REST_SLOTS_BATTERS_ONLY=%s)",
         team_key,
         schedule_labels,
         timezone_name,
+        rest_slots_batters_only,
     )
 
 

@@ -23,6 +23,17 @@ BATTING_FLEX_MAP = {
     "OF": OUTFIELD_POSITIONS,
 }
 NON_SCORING_STAT_IDS = {"60"}  # H/AB display stat is redundant with AVG for scoring
+MIN_TREND_AT_BATS_7D = 10
+TREND_VELOCITY_DAYS = 23
+WPE_WEIGHTS = {
+    "score_7d": 0.50,
+    "score_30d": 0.35,
+    "score_26": 0.15,
+    "score_25": 0.0,
+}
+WPE_TIE_THRESHOLD = 0.1
+DIAGNOSTIC_CLUSTER_THRESHOLD = 0.35
+DIAGNOSTIC_FLUKE_THRESHOLD = 1.0
 
 
 def _today(date: Optional[str]) -> str:
@@ -33,6 +44,44 @@ def _league_key_from_team_key(team_key: str) -> str:
     if ".t." not in team_key:
         raise ValueError(f"Invalid Yahoo team_key: {team_key}")
     return team_key.split(".t.")[0]
+
+
+def _resolved_wpe_weights(
+    weight_7d: Optional[float] = None,
+    weight_30d: Optional[float] = None,
+) -> dict[str, float]:
+    weights = dict(WPE_WEIGHTS)
+    if weight_7d is None and weight_30d is None:
+        return weights
+
+    recent_7d = max(0.0, weight_7d if weight_7d is not None else weights["score_7d"])
+    recent_30d = max(0.0, weight_30d if weight_30d is not None else weights["score_30d"])
+    recent_total = recent_7d + recent_30d
+    if recent_total >= 1.0:
+        if recent_total == 0:
+            return weights
+        return {
+            "score_7d": recent_7d / recent_total,
+            "score_30d": recent_30d / recent_total,
+            "score_26": 0.0,
+            "score_25": 0.0,
+        }
+
+    remaining_total = 1.0 - recent_total
+    baseline_total = WPE_WEIGHTS["score_26"] + WPE_WEIGHTS["score_25"]
+    if baseline_total <= 0:
+        score_26_weight = remaining_total
+        score_25_weight = 0.0
+    else:
+        score_26_weight = remaining_total * (WPE_WEIGHTS["score_26"] / baseline_total)
+        score_25_weight = remaining_total * (WPE_WEIGHTS["score_25"] / baseline_total)
+
+    return {
+        "score_7d": recent_7d,
+        "score_30d": recent_30d,
+        "score_26": score_26_weight,
+        "score_25": score_25_weight,
+    }
 
 
 def _slot_name(slot: str) -> str:
@@ -52,7 +101,11 @@ def _normalize_position(pos: str) -> str:
 
 
 def _is_pitcher_only(player: dict) -> bool:
-    positions = {_normalize_position(pos) for pos in player.get("eligible_positions") or player.get("positions") or []}
+    positions = {
+        _normalize_position(pos)
+        for pos in player.get("eligible_positions") or player.get("positions") or []
+        if _normalize_position(pos) not in LOCKED_SLOTS
+    }
     return bool(positions) and positions.issubset(PITCHING_POSITIONS)
 
 
@@ -105,30 +158,34 @@ def _player_can_fill_slot(player: dict, slot: str) -> bool:
     return norm_slot in eligible
 
 
-def _merge_stat_rosters(
-    roster_7d: list[dict],
-    roster_30d: list[dict],
+def _merge_stat_windows(
+    roster_details: list[dict],
+    stat_rosters: dict[str, list[dict]],
 ) -> list[dict]:
     by_key: dict[str, dict] = {}
-    for player in roster_30d:
+    for player in roster_details:
         player_key = player.get("player_key")
         if player_key:
             by_key[player_key] = dict(player)
 
-    for player in roster_7d:
-        player_key = player.get("player_key")
-        if not player_key:
-            continue
-        merged = by_key.get(player_key, {}).copy()
-        merged.update(player)
-        merged["stats_7d"] = dict(player.get("stats_map") or {})
-        if "stats_30d" not in merged:
-            merged["stats_30d"] = dict(by_key.get(player_key, {}).get("stats_map") or {})
-        by_key[player_key] = merged
+    for window, roster in stat_rosters.items():
+        for player in roster:
+            player_key = player.get("player_key")
+            if not player_key:
+                continue
+            merged = by_key.get(player_key, {}).copy()
+            for key, value in player.items():
+                if key in {"stats_map", "stat_type"}:
+                    continue
+                existing = merged.get(key)
+                if key not in merged or existing is None or existing == "" or existing == []:
+                    merged[key] = value
+            merged[f"stats_{window}"] = dict(player.get("stats_map") or {})
+            by_key[player_key] = merged
 
     for player in by_key.values():
-        if "stats_30d" not in player:
-            player["stats_30d"] = dict(player.get("stats_map") or {})
+        for window in stat_rosters:
+            player.setdefault(f"stats_{window}", {})
 
     return sorted(
         by_key.values(),
@@ -136,6 +193,14 @@ def _merge_stat_rosters(
             player.get("name", ""),
         ),
     )
+
+
+def _merge_stat_rosters(
+    roster_7d: list[dict],
+    roster_30d: list[dict],
+) -> list[dict]:
+    """Backward-compatible two-window merge for older callers/tests."""
+    return _merge_stat_windows(roster_30d, {"30d": roster_30d, "7d": roster_7d})
 
 
 def _parse_stat_value(stat_id: str, raw_value: str | None) -> float:
@@ -158,6 +223,17 @@ def _parse_stat_value(stat_id: str, raw_value: str | None) -> float:
         return 0.0
 
 
+def _parse_at_bats_from_hits_at_bats(raw_value: str | None) -> int:
+    value = str(raw_value or "").strip()
+    if "/" not in value:
+        return 0
+    _, at_bats = value.split("/", 1)
+    try:
+        return int(float(at_bats))
+    except ValueError:
+        return 0
+
+
 def _scoring_stat_ids(batting_categories: list[dict]) -> list[str]:
     ids: list[str] = []
     has_avg = any(str(row.get("stat_id")) == "3" for row in batting_categories or [])
@@ -171,72 +247,318 @@ def _scoring_stat_ids(batting_categories: list[dict]) -> list[str]:
     return ids
 
 
+def _trend_metrics(score_7d: float, score_30d: float, at_bats_7d: int) -> dict:
+    if at_bats_7d < MIN_TREND_AT_BATS_7D:
+        return {
+            "at_bats_7d": at_bats_7d,
+            "trend_sample_ok": False,
+            "trend_sample_reason": f"Fewer than {MIN_TREND_AT_BATS_7D} AB in 7-day window",
+            "breakout_index": None,
+            "stability_index": None,
+            "trend_velocity": None,
+        }
+
+    breakout_index = score_7d - score_30d
+    stability_index = score_30d - score_7d
+    return {
+        "at_bats_7d": at_bats_7d,
+        "trend_sample_ok": True,
+        "trend_sample_reason": None,
+        "breakout_index": round(breakout_index, 3),
+        "stability_index": round(stability_index, 3),
+        "trend_velocity": round(breakout_index / TREND_VELOCITY_DAYS, 4),
+    }
+
+
+def _diagnose_player(player: dict) -> dict:
+    score_25 = player.get("score_25") or 0.0
+    score_26 = player.get("score_26") or 0.0
+    score_30d = player.get("score_30d") or 0.0
+    score_7d = player.get("score_7d") or 0.0
+
+    if score_25 > score_26 > score_30d > score_7d:
+        return {
+            "diagnostic_label": "washed",
+            "diagnostic_action": "Drop/Trade",
+            "diagnostic_reason": "2025 baseline, current season, 30-day, and 7-day scores decline in order",
+        }
+
+    if score_26 > score_30d and score_26 > score_7d:
+        return {
+            "diagnostic_label": "slump",
+            "diagnostic_action": "Hold/Buy",
+            "diagnostic_reason": "Current-season score remains above both recent windows",
+        }
+
+    long_window_scores = [score_25, score_26, score_30d]
+    long_windows_clustered = max(long_window_scores) - min(long_window_scores) <= DIAGNOSTIC_CLUSTER_THRESHOLD
+    if long_windows_clustered and score_7d - max(long_window_scores) >= DIAGNOSTIC_FLUKE_THRESHOLD:
+        return {
+            "diagnostic_label": "fluke",
+            "diagnostic_action": "Sell High",
+            "diagnostic_reason": "7-day score is materially above clustered longer-window baselines",
+        }
+
+    return {
+        "diagnostic_label": "stable",
+        "diagnostic_action": "Monitor",
+        "diagnostic_reason": "No strong four-window diagnostic signal",
+    }
+
+
+def _bottom_quartile_threshold(players: list[dict], field: str) -> float | None:
+    values = sorted(
+        float(player.get(field) or 0.0)
+        for player in players
+        if not _is_pitcher_only(player)
+    )
+    if not values:
+        return None
+    index = max(0, (len(values) + 3) // 4 - 1)
+    return values[index]
+
+
+def _apply_absolute_floor_signals(players: list[dict]) -> list[dict]:
+    score_26_floor = _bottom_quartile_threshold(players, "score_26")
+    score_30d_floor = _bottom_quartile_threshold(players, "score_30d")
+    if score_26_floor is None or score_30d_floor is None:
+        return players
+
+    updated: list[dict] = []
+    for player in players:
+        diagnostic_label = player.get("diagnostic_label")
+        is_floor_problem = (
+            not _is_pitcher_only(player)
+            and diagnostic_label not in {"washed", "fluke"}
+            and float(player.get("score_26") or 0.0) <= score_26_floor
+            and float(player.get("score_30d") or 0.0) <= score_30d_floor
+        )
+        if not is_floor_problem:
+            updated.append(player)
+            continue
+
+        updated.append(
+            {
+                **player,
+                "diagnostic_label": "chronic_underperformer",
+                "diagnostic_action": "Drop/Trade",
+                "diagnostic_reason": (
+                    "Consistently bottom-quartile in season and 30-day windows; "
+                    "not a trend, just a floor problem"
+                ),
+            }
+        )
+    return updated
+
+
+def _trend_player_summary(player: dict, signal: str | None = None) -> dict:
+    summary = {
+        "player_key": player.get("player_key"),
+        "player": player.get("name"),
+        "team": player.get("team"),
+        "display_position": player.get("display_position"),
+        "eligible_positions": player.get("eligible_positions"),
+        "selected_position": player.get("selected_position"),
+        "at_bats_7d": player.get("at_bats_7d"),
+        "score_25": player.get("score_25"),
+        "score_26": player.get("score_26"),
+        "score_7d": player.get("score_7d"),
+        "score_30d": player.get("score_30d"),
+        "composite_score": player.get("composite_score"),
+        "wpe_score": player.get("wpe_score"),
+        "breakout_index": player.get("breakout_index"),
+        "stability_index": player.get("stability_index"),
+        "trend_velocity": player.get("trend_velocity"),
+        "trend_sample_ok": player.get("trend_sample_ok"),
+        "trend_sample_reason": player.get("trend_sample_reason"),
+        "diagnostic_label": player.get("diagnostic_label"),
+        "diagnostic_action": player.get("diagnostic_action"),
+        "diagnostic_reason": player.get("diagnostic_reason"),
+    }
+    if signal:
+        summary["signal"] = signal
+    return summary
+
+
+def _trend_alerts(players: list[dict], limit: int = 10) -> list[dict]:
+    alerts: list[tuple[float, dict]] = []
+    for player in players:
+        label = player.get("diagnostic_label")
+        score_7d = player.get("score_7d") or 0.0
+        score_30d = player.get("score_30d") or 0.0
+        score_26 = player.get("score_26") or 0.0
+        score_25 = player.get("score_25") or 0.0
+
+        if label == "washed":
+            alert = _trend_player_summary(player, signal="drop_or_trade_candidate")
+            alert["reason"] = player.get("diagnostic_reason")
+            alerts.append((300 + (score_25 - score_7d), alert))
+            continue
+
+        if label == "chronic_underperformer":
+            alert = _trend_player_summary(player, signal="drop_or_trade_candidate")
+            alert["reason"] = player.get("diagnostic_reason")
+            alerts.append((250 + abs(min(score_26, score_30d, 0.0)), alert))
+            continue
+
+        if label == "fluke":
+            alert = _trend_player_summary(player, signal="sell_high_candidate")
+            alert["reason"] = player.get("diagnostic_reason")
+            alerts.append((200 + (score_7d - max(score_30d, score_26, score_25)), alert))
+            continue
+
+        if label == "slump":
+            alert = _trend_player_summary(player, signal="hold_or_buy_candidate")
+            alert["reason"] = player.get("diagnostic_reason")
+            alerts.append((100 + (score_26 - min(score_30d, score_7d)), alert))
+
+    return [
+        alert
+        for _, alert in sorted(
+            alerts,
+            key=lambda item: (
+                -item[0],
+                item[1].get("player") or "",
+            ),
+        )[:limit]
+    ]
+
+
+def _player_evaluation_fields(player: dict) -> dict:
+    return {
+        "score_25": player.get("score_25"),
+        "score_26": player.get("score_26"),
+        "score_30d": player.get("score_30d"),
+        "score_7d": player.get("score_7d"),
+        "wpe_score": player.get("wpe_score"),
+        "composite_score": player.get("composite_score"),
+        "diagnostic_label": player.get("diagnostic_label"),
+        "diagnostic_action": player.get("diagnostic_action"),
+        "diagnostic_reason": player.get("diagnostic_reason"),
+    }
+
+
+def _scored_roster_context(
+    api: YahooFantasyAPI,
+    team_key: str,
+    date: Optional[str],
+    weight_7d: Optional[float],
+    weight_30d: Optional[float],
+) -> tuple[str, str, dict, list[dict], list[dict]]:
+    date = _today(date)
+    league_key = _league_key_from_team_key(team_key)
+    settings = api.get_league_scoring_settings(league_key) or {}
+    batting_categories = settings.get("batting_categories") or []
+    roster_details = api.get_team_roster_details(team_key, date=date)
+    roster_25 = api.get_team_roster_stats(team_key, stat_type="season", season="2025")
+    roster_26 = api.get_team_roster_stats(team_key, stat_type="season")
+    roster_30d = api.get_team_roster_stats(team_key, stat_type="lastmonth")
+    roster_7d = api.get_team_roster_stats(team_key, stat_type="lastweek")
+    players = _apply_recent_stat_scores(
+        _merge_stat_windows(
+            roster_details,
+            {
+                "25": roster_25,
+                "26": roster_26,
+                "30d": roster_30d,
+                "7d": roster_7d,
+            },
+        ),
+        batting_categories,
+        weight_7d,
+        weight_30d,
+    )
+    return date, league_key, settings, batting_categories, players
+
+
 def _apply_recent_stat_scores(
     players: list[dict],
     batting_categories: list[dict],
-    weight_7d: float,
-    weight_30d: float,
+    weight_7d: Optional[float],
+    weight_30d: Optional[float],
 ) -> list[dict]:
     stat_ids = _scoring_stat_ids(batting_categories)
     if not stat_ids:
         return players
+    wpe_weights = _resolved_wpe_weights(weight_7d, weight_30d)
 
-    values_7d: dict[str, list[float]] = {stat_id: [] for stat_id in stat_ids}
-    values_30d: dict[str, list[float]] = {stat_id: [] for stat_id in stat_ids}
-    for player in players:
-        stats_7d = player.get("stats_7d") or {}
-        stats_30d = player.get("stats_30d") or {}
-        for stat_id in stat_ids:
-            values_7d[stat_id].append(_parse_stat_value(stat_id, stats_7d.get(stat_id)))
-            values_30d[stat_id].append(_parse_stat_value(stat_id, stats_30d.get(stat_id)))
-
-    baselines_7d = {
-        stat_id: (mean(series), pstdev(series) if len(series) > 1 else 0.0)
-        for stat_id, series in values_7d.items()
+    windows = ["25", "26", "30d", "7d"]
+    values_by_window: dict[str, dict[str, list[float]]] = {
+        window: {stat_id: [] for stat_id in stat_ids}
+        for window in windows
     }
-    baselines_30d = {
-        stat_id: (mean(series), pstdev(series) if len(series) > 1 else 0.0)
-        for stat_id, series in values_30d.items()
+    for player in players:
+        stats_by_window = {
+            window: player.get(f"stats_{window}") or {}
+            for window in windows
+        }
+        for stat_id in stat_ids:
+            for window in windows:
+                values_by_window[window][stat_id].append(
+                    _parse_stat_value(stat_id, stats_by_window[window].get(stat_id))
+                )
+
+    baselines_by_window = {
+        window: {
+            stat_id: (mean(series), pstdev(series) if len(series) > 1 else 0.0)
+            for stat_id, series in stat_values.items()
+        }
+        for window, stat_values in values_by_window.items()
     }
 
     scored_players: list[dict] = []
     for player in players:
-        stats_7d = player.get("stats_7d") or {}
-        stats_30d = player.get("stats_30d") or {}
-        z_scores_7d: dict[str, float] = {}
-        z_scores_30d: dict[str, float] = {}
-        score_7d = 0.0
-        score_30d = 0.0
+        z_scores_by_window: dict[str, dict[str, float]] = {window: {} for window in windows}
+        scores_by_window: dict[str, float] = {window: 0.0 for window in windows}
+        stats_by_window = {
+            window: player.get(f"stats_{window}") or {}
+            for window in windows
+        }
         for stat_id in stat_ids:
-            value_7d = _parse_stat_value(stat_id, stats_7d.get(stat_id))
-            mean_7d, stdev_7d = baselines_7d[stat_id]
-            z_7d = 0.0 if stdev_7d == 0 else (value_7d - mean_7d) / stdev_7d
-            z_scores_7d[stat_id] = round(z_7d, 3)
-            score_7d += z_7d
+            for window in windows:
+                value = _parse_stat_value(stat_id, stats_by_window[window].get(stat_id))
+                mean_value, stdev_value = baselines_by_window[window][stat_id]
+                z_score = 0.0 if stdev_value == 0 else (value - mean_value) / stdev_value
+                z_scores_by_window[window][stat_id] = round(z_score, 3)
+                scores_by_window[window] += z_score
 
-            value_30d = _parse_stat_value(stat_id, stats_30d.get(stat_id))
-            mean_30d, stdev_30d = baselines_30d[stat_id]
-            z_30d = 0.0 if stdev_30d == 0 else (value_30d - mean_30d) / stdev_30d
-            z_scores_30d[stat_id] = round(z_30d, 3)
-            score_30d += z_30d
-
-        composite_score = round((weight_7d * score_7d) + (weight_30d * score_30d), 3)
-        scored_players.append(
-            {
-                **player,
-                "scoring_stat_ids": stat_ids,
-                "z_scores_7d": z_scores_7d,
-                "z_scores_30d": z_scores_30d,
-                "score_7d": round(score_7d, 3),
-                "score_30d": round(score_30d, 3),
-                "composite_score": composite_score,
-            }
+        rounded_score_25 = round(scores_by_window["25"], 3)
+        rounded_score_26 = round(scores_by_window["26"], 3)
+        rounded_score_30d = round(scores_by_window["30d"], 3)
+        rounded_score_7d = round(scores_by_window["7d"], 3)
+        wpe_score = round(
+            (wpe_weights["score_7d"] * rounded_score_7d)
+            + (wpe_weights["score_30d"] * rounded_score_30d)
+            + (wpe_weights["score_26"] * rounded_score_26)
+            + (wpe_weights["score_25"] * rounded_score_25),
+            3,
         )
+        composite_score = wpe_score
+        at_bats_7d = _parse_at_bats_from_hits_at_bats(stats_by_window["7d"].get("60"))
+        scored_player = {
+            **player,
+            "scoring_stat_ids": stat_ids,
+            "z_scores_25": z_scores_by_window["25"],
+            "z_scores_26": z_scores_by_window["26"],
+            "z_scores_30d": z_scores_by_window["30d"],
+            "z_scores_7d": z_scores_by_window["7d"],
+            "score_25": rounded_score_25,
+            "score_26": rounded_score_26,
+            "score_30d": rounded_score_30d,
+            "score_7d": rounded_score_7d,
+            "wpe_score": wpe_score,
+            # Keep composite_score for older UI/email consumers; it now means WPE.
+            "composite_score": composite_score,
+            **_trend_metrics(rounded_score_7d, rounded_score_30d, at_bats_7d),
+        }
+        scored_player.update(_diagnose_player(scored_player))
+        scored_players.append(scored_player)
 
     return sorted(
-        scored_players,
+        _apply_absolute_floor_signals(scored_players),
         key=lambda player: (
-            -(player.get("composite_score") or 0.0),
+            -(player.get("wpe_score") or 0.0),
+            -(player.get("score_26") or 0.0),
             player.get("name", ""),
         ),
     )
@@ -246,10 +568,48 @@ def _sorted_candidates(players: list[dict], slot: str) -> list[dict]:
     return sorted(
         [player for player in players if _player_can_fill_slot(player, slot)],
         key=lambda player: (
-            -(player.get("composite_score") or -9999.0),
+            -_numeric_player_score(player, "wpe_score"),
+            -_numeric_player_score(player, "score_26"),
             player.get("name", ""),
         ),
     )
+
+
+def _numeric_player_score(player: dict, field: str, default: float = -9999.0) -> float:
+    value = player.get(field)
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _best_candidate(candidates: list[dict]) -> dict | None:
+    if not candidates:
+        return None
+    ordered = sorted(
+        candidates,
+        key=lambda player: (
+            -_numeric_player_score(player, "wpe_score"),
+            player.get("name", ""),
+        ),
+    )
+    best = ordered[0]
+    tied = [
+        player
+        for player in ordered
+        if abs((player.get("wpe_score") or 0.0) - (best.get("wpe_score") or 0.0)) < WPE_TIE_THRESHOLD
+    ]
+    if len(tied) <= 1:
+        return best
+    return sorted(
+        tied,
+        key=lambda player: (
+            -_numeric_player_score(player, "score_26"),
+            player.get("name", ""),
+        ),
+    )[0]
 
 
 def _slot_priority(slot: str) -> tuple[int, str]:
@@ -262,98 +622,96 @@ def _slot_priority(slot: str) -> tuple[int, str]:
 
 
 def _assign_slots(players: list[dict], active_slots: list[str]) -> tuple[dict[str, str], list[dict]]:
-    remaining_players = {player["player_key"]: player for player in players}
+    if not players or not active_slots:
+        return {}, []
+
+    player_by_index = list(players)
+    eligible_player_indices_by_slot = [
+        [
+            player_index
+            for player_index, player in enumerate(player_by_index)
+            if _player_can_fill_slot(player, slot)
+        ]
+        for slot in active_slots
+    ]
+
+    def score_with_player(score: tuple[int, float, float], player: dict) -> tuple[int, float, float]:
+        return (
+            score[0] + 1,
+            score[1] + _numeric_player_score(player, "wpe_score"),
+            score[2] + _numeric_player_score(player, "score_26"),
+        )
+
+    def score_key(score: tuple[int, float, float]) -> tuple[int, float, float]:
+        return (score[0], round(score[1], 6), round(score[2], 6))
+
+    def assignment_signature(assignments: tuple[tuple[int, int], ...]) -> tuple[tuple[int, str, str], ...]:
+        return tuple(
+            (
+                slot_index,
+                player_by_index[player_index].get("name", ""),
+                player_by_index[player_index].get("player_key", ""),
+            )
+            for slot_index, player_index in assignments
+        )
+
+    def is_better_state(
+        candidate: tuple[tuple[int, float, float], tuple[tuple[int, int], ...]],
+        incumbent: tuple[tuple[int, float, float], tuple[tuple[int, int], ...]] | None,
+    ) -> bool:
+        if incumbent is None:
+            return True
+        candidate_score, candidate_assignments = candidate
+        incumbent_score, incumbent_assignments = incumbent
+        if score_key(candidate_score) != score_key(incumbent_score):
+            return score_key(candidate_score) > score_key(incumbent_score)
+        return assignment_signature(candidate_assignments) < assignment_signature(incumbent_assignments)
+
+    states: dict[int, tuple[tuple[int, float, float], tuple[tuple[int, int], ...]]] = {
+        0: ((0, 0.0, 0.0), tuple())
+    }
+    for slot_index, player_indices in enumerate(eligible_player_indices_by_slot):
+        next_states = dict(states)
+        for used_mask, (score, assignments_so_far) in states.items():
+            for player_index in player_indices:
+                bit = 1 << player_index
+                if used_mask & bit:
+                    continue
+                player = player_by_index[player_index]
+                candidate_state = (
+                    score_with_player(score, player),
+                    assignments_so_far + ((slot_index, player_index),),
+                )
+                next_mask = used_mask | bit
+                if is_better_state(candidate_state, next_states.get(next_mask)):
+                    next_states[next_mask] = candidate_state
+        states = next_states
+
+    best_state: tuple[tuple[int, float, float], tuple[tuple[int, int], ...]] | None = None
+    for state in states.values():
+        if is_better_state(state, best_state):
+            best_state = state
+    if best_state is None:
+        return {}, []
+    best_score, best_assignment_pairs = best_state
+    if best_score[0] == 0:
+        return {}, []
+
     assignments: dict[str, str] = {}
     details: list[dict] = []
-
-    position_slots = [slot for slot in active_slots if _normalize_position(slot) not in {"OF", "UTIL"}]
-    outfield_slots = [slot for slot in active_slots if _normalize_position(slot) == "OF"]
-    utility_slots = [slot for slot in active_slots if _normalize_position(slot) == "UTIL"]
-
-    unfilled_slots = list(position_slots)
-
-    # Lock one-option slots first so multi-eligible batters don't clog scarce positions.
-    changed = True
-    while changed:
-        changed = False
-        for slot in list(unfilled_slots):
-            candidates = _sorted_candidates(list(remaining_players.values()), slot)
-            if len(candidates) != 1:
-                continue
-            player = candidates[0]
-            assignments[player["player_key"]] = slot
-            details.append(
-                {
-                    "action": "start",
-                    "player": player["name"],
-                    "to": slot,
-                    "reason": "Only eligible remaining candidate for slot",
-                    "composite_score": player.get("composite_score"),
-                }
-            )
-            remaining_players.pop(player["player_key"], None)
-            unfilled_slots.remove(slot)
-            changed = True
-
-    while unfilled_slots:
-        slot_candidates = []
-        for slot in unfilled_slots:
-            candidates = _sorted_candidates(list(remaining_players.values()), slot)
-            slot_candidates.append((len(candidates), _slot_priority(slot), slot, candidates))
-        slot_candidates.sort(key=lambda item: (item[0], item[1], item[2]))
-
-        _, _, slot, candidates = slot_candidates[0]
-        if not candidates:
-            unfilled_slots.remove(slot)
-            continue
-
-        player = candidates[0]
+    for slot_index, player_index in sorted(best_assignment_pairs):
+        slot = active_slots[slot_index]
+        player = player_by_index[player_index]
         assignments[player["player_key"]] = slot
         details.append(
             {
                 "action": "start",
                 "player": player["name"],
                 "to": slot,
-                "reason": "Best ranked eligible batter for scarce slot",
-                "composite_score": player.get("composite_score"),
+                "reason": "Globally optimal WPE assignment across active batting slots",
+                **_player_evaluation_fields(player),
             }
         )
-        remaining_players.pop(player["player_key"], None)
-        unfilled_slots.remove(slot)
-
-    for slot in outfield_slots:
-        candidates = _sorted_candidates(list(remaining_players.values()), slot)
-        if not candidates:
-            continue
-        player = candidates[0]
-        assignments[player["player_key"]] = slot
-        details.append(
-            {
-                "action": "start",
-                "player": player["name"],
-                "to": slot,
-                "reason": "Best remaining outfielder",
-                "composite_score": player.get("composite_score"),
-            }
-        )
-        remaining_players.pop(player["player_key"], None)
-
-    for slot in utility_slots:
-        candidates = _sorted_candidates(list(remaining_players.values()), slot)
-        if not candidates:
-            continue
-        player = candidates[0]
-        assignments[player["player_key"]] = slot
-        details.append(
-            {
-                "action": "start",
-                "player": player["name"],
-                "to": slot,
-                "reason": "Best remaining hitter for utility slot",
-                "composite_score": player.get("composite_score"),
-            }
-        )
-        remaining_players.pop(player["player_key"], None)
 
     return assignments, details
 
@@ -362,51 +720,46 @@ def get_optimal_batting_lineup_changes(
     api: YahooFantasyAPI,
     team_key: str,
     date: Optional[str] = None,
-    weight_7d: float = 0.6,
-    weight_30d: float = 0.4,
+    weight_7d: Optional[float] = None,
+    weight_30d: Optional[float] = None,
 ) -> tuple[list[tuple[str, str]], list[dict], dict]:
     """
-    Compute batting-only lineup changes based on a weighted 7d/30d Yahoo rank.
+    Compute batting-only lineup changes based on four-window WPE scores.
 
     Returns:
         (position_changes, details, summary)
     """
-    date = _today(date)
-    league_key = _league_key_from_team_key(team_key)
-
-    settings = api.get_league_scoring_settings(league_key) or {}
-    batting_categories = settings.get("batting_categories") or []
-    roster_7d = api.get_team_roster_stats(team_key, date=date, stat_type="lastweek")
-    roster_30d = api.get_team_roster_stats(team_key, date=date, stat_type="lastmonth")
-    players = _apply_recent_stat_scores(
-        _merge_stat_rosters(roster_7d, roster_30d),
-        batting_categories,
+    date, league_key, settings, batting_categories, players = _scored_roster_context(
+        api,
+        team_key,
+        date,
         weight_7d,
         weight_30d,
     )
-
-    active_slots, _ = _parse_roster_slots(settings.get("roster_positions") or [])
-    if not active_slots:
-        return [], [], {
-            "date": date,
-            "team_key": team_key,
-            "league_key": league_key,
-            "weight_7d": weight_7d,
-            "weight_30d": weight_30d,
-            "score_mode": "category_zscore",
-            "movable_batters": 0,
-            "playing_batters": 0,
-            "off_day_batters": 0,
-            "confirmed_bench_batters": 0,
-            "changes_count": 0,
-            "warning": "No active batting slots were returned from Yahoo league settings",
-        }
+    wpe_weights = _resolved_wpe_weights(weight_7d, weight_30d)
 
     movable_batters = [
         player
         for player in players
         if not _is_pitcher_only(player) and not _is_locked_player(player)
     ]
+    active_slots, _ = _parse_roster_slots(settings.get("roster_positions") or [])
+    if not active_slots:
+        return [], [], {
+            "date": date,
+            "team_key": team_key,
+            "league_key": league_key,
+            "wpe_weights": wpe_weights,
+            "score_mode": "four_window_wpe",
+            "movable_batters": 0,
+            "playing_batters": 0,
+            "off_day_batters": 0,
+            "confirmed_bench_batters": 0,
+            "changes_count": 0,
+            "trend_alerts": _trend_alerts(movable_batters),
+            "warning": "No active batting slots were returned from Yahoo league settings",
+        }
+
     playing_batters = [
         player
         for player in movable_batters
@@ -449,11 +802,11 @@ def get_optimal_batting_lineup_changes(
                         if player.get("has_game_today") is False
                         else "Confirmed not in starting lineup"
                         if player.get("is_starting") is False
-                        else "Recent performance optimization"
+                        else "Weighted performance expectation optimization"
                     ),
-                    "score_7d": player.get("score_7d"),
-                    "score_30d": player.get("score_30d"),
-                    "composite_score": player.get("composite_score"),
+                    **_player_evaluation_fields(player),
+                    "z_scores_25": player.get("z_scores_25"),
+                    "z_scores_26": player.get("z_scores_26"),
                     "z_scores_7d": player.get("z_scores_7d"),
                     "z_scores_30d": player.get("z_scores_30d"),
                     "opponent": player.get("opponent"),
@@ -464,17 +817,75 @@ def get_optimal_batting_lineup_changes(
         "date": date,
         "team_key": team_key,
         "league_key": league_key,
-        "weight_7d": weight_7d,
-        "weight_30d": weight_30d,
-        "score_mode": "category_zscore",
+        "wpe_weights": wpe_weights,
+        "wpe_tie_threshold": WPE_TIE_THRESHOLD,
+        "score_mode": "four_window_wpe",
         "scoring_stat_ids": _scoring_stat_ids(batting_categories),
         "movable_batters": len(movable_batters),
         "playing_batters": len(playing_batters),
         "off_day_batters": len(off_day_batters),
         "confirmed_bench_batters": len(confirmed_bench_batters),
         "changes_count": len(changes),
+        "trend_alerts": _trend_alerts(movable_batters),
     }
     return changes, details, summary
+
+
+def evaluate_roster_trends(
+    api: YahooFantasyAPI,
+    team_key: str,
+    date: Optional[str] = None,
+    weight_7d: Optional[float] = None,
+    weight_30d: Optional[float] = None,
+) -> dict:
+    """
+    Evaluate roster batters for WPE and four-window diagnostic signals without moving players.
+    """
+    date, league_key, _, batting_categories, players = _scored_roster_context(
+        api,
+        team_key,
+        date,
+        weight_7d,
+        weight_30d,
+    )
+    wpe_weights = _resolved_wpe_weights(weight_7d, weight_30d)
+    batters = [
+        player
+        for player in players
+        if not _is_pitcher_only(player) and not _is_locked_player(player)
+    ]
+    diagnostic_priority = {
+        "washed": 0,
+        "chronic_underperformer": 1,
+        "fluke": 2,
+        "slump": 3,
+        "stable": 4,
+    }
+    trends = [
+        _trend_player_summary(player)
+        for player in sorted(
+            batters,
+            key=lambda player: (
+                diagnostic_priority.get(player.get("diagnostic_label"), 9),
+                -(player.get("wpe_score") or -9999.0),
+                player.get("name", ""),
+            ),
+        )
+    ]
+
+    return {
+        "date": date,
+        "team_key": team_key,
+        "league_key": league_key,
+        "wpe_weights": wpe_weights,
+        "wpe_tie_threshold": WPE_TIE_THRESHOLD,
+        "score_mode": "four_window_wpe",
+        "scoring_stat_ids": _scoring_stat_ids(batting_categories),
+        "min_trend_at_bats_7d": MIN_TREND_AT_BATS_7D,
+        "trend_velocity_days": TREND_VELOCITY_DAYS,
+        "trend_alerts": _trend_alerts(batters),
+        "players": trends,
+    }
 
 
 def optimize_batting_lineup(
@@ -482,8 +893,8 @@ def optimize_batting_lineup(
     team_key: str,
     date: Optional[str] = None,
     dry_run: bool = True,
-    weight_7d: float = 0.6,
-    weight_30d: float = 0.4,
+    weight_7d: Optional[float] = None,
+    weight_30d: Optional[float] = None,
 ) -> dict:
     """
     Optimize batter slots and optionally apply the resulting Yahoo roster updates.
