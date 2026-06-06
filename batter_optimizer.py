@@ -101,7 +101,11 @@ def _normalize_position(pos: str) -> str:
 
 
 def _is_pitcher_only(player: dict) -> bool:
-    positions = {_normalize_position(pos) for pos in player.get("eligible_positions") or player.get("positions") or []}
+    positions = {
+        _normalize_position(pos)
+        for pos in player.get("eligible_positions") or player.get("positions") or []
+        if _normalize_position(pos) not in LOCKED_SLOTS
+    }
     return bool(positions) and positions.issubset(PITCHING_POSITIONS)
 
 
@@ -302,6 +306,51 @@ def _diagnose_player(player: dict) -> dict:
     }
 
 
+def _bottom_quartile_threshold(players: list[dict], field: str) -> float | None:
+    values = sorted(
+        float(player.get(field) or 0.0)
+        for player in players
+        if not _is_pitcher_only(player)
+    )
+    if not values:
+        return None
+    index = max(0, (len(values) + 3) // 4 - 1)
+    return values[index]
+
+
+def _apply_absolute_floor_signals(players: list[dict]) -> list[dict]:
+    score_26_floor = _bottom_quartile_threshold(players, "score_26")
+    score_30d_floor = _bottom_quartile_threshold(players, "score_30d")
+    if score_26_floor is None or score_30d_floor is None:
+        return players
+
+    updated: list[dict] = []
+    for player in players:
+        diagnostic_label = player.get("diagnostic_label")
+        is_floor_problem = (
+            not _is_pitcher_only(player)
+            and diagnostic_label not in {"washed", "fluke"}
+            and float(player.get("score_26") or 0.0) <= score_26_floor
+            and float(player.get("score_30d") or 0.0) <= score_30d_floor
+        )
+        if not is_floor_problem:
+            updated.append(player)
+            continue
+
+        updated.append(
+            {
+                **player,
+                "diagnostic_label": "chronic_underperformer",
+                "diagnostic_action": "Drop/Trade",
+                "diagnostic_reason": (
+                    "Consistently bottom-quartile in season and 30-day windows; "
+                    "not a trend, just a floor problem"
+                ),
+            }
+        )
+    return updated
+
+
 def _trend_player_summary(player: dict, signal: str | None = None) -> dict:
     summary = {
         "player_key": player.get("player_key"),
@@ -344,6 +393,12 @@ def _trend_alerts(players: list[dict], limit: int = 10) -> list[dict]:
             alert = _trend_player_summary(player, signal="drop_or_trade_candidate")
             alert["reason"] = player.get("diagnostic_reason")
             alerts.append((300 + (score_25 - score_7d), alert))
+            continue
+
+        if label == "chronic_underperformer":
+            alert = _trend_player_summary(player, signal="drop_or_trade_candidate")
+            alert["reason"] = player.get("diagnostic_reason")
+            alerts.append((250 + abs(min(score_26, score_30d, 0.0)), alert))
             continue
 
         if label == "fluke":
@@ -500,7 +555,7 @@ def _apply_recent_stat_scores(
         scored_players.append(scored_player)
 
     return sorted(
-        scored_players,
+        _apply_absolute_floor_signals(scored_players),
         key=lambda player: (
             -(player.get("wpe_score") or 0.0),
             -(player.get("score_26") or 0.0),
@@ -794,12 +849,17 @@ def evaluate_roster_trends(
         weight_30d,
     )
     wpe_weights = _resolved_wpe_weights(weight_7d, weight_30d)
-    batters = [player for player in players if not _is_pitcher_only(player)]
+    batters = [
+        player
+        for player in players
+        if not _is_pitcher_only(player) and not _is_locked_player(player)
+    ]
     diagnostic_priority = {
         "washed": 0,
-        "fluke": 1,
-        "slump": 2,
-        "stable": 3,
+        "chronic_underperformer": 1,
+        "fluke": 2,
+        "slump": 3,
+        "stable": 4,
     }
     trends = [
         _trend_player_summary(player)

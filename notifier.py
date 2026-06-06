@@ -50,6 +50,27 @@ def _has_any_trend_alerts(results: list[dict]) -> bool:
     return any(_trend_alerts_for_entry(entry) for entry in results)
 
 
+def _waiver_payload_for_entry(entry: dict) -> dict:
+    result = entry.get("result") or {}
+    payload = result.get("waiver_suggestions") or {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _waiver_suggestions_for_entry(entry: dict) -> list[dict]:
+    return list(_waiver_payload_for_entry(entry).get("suggestions") or [])
+
+
+def _total_waiver_suggestion_count(results: list[dict]) -> int:
+    return sum(len(_waiver_suggestions_for_entry(entry)) for entry in results)
+
+
+def _has_any_waiver_output(results: list[dict]) -> bool:
+    return any(
+        _waiver_suggestions_for_entry(entry) or (entry.get("result") or {}).get("waiver_error")
+        for entry in results
+    )
+
+
 def should_notify_optimization_results(results: list[dict]) -> bool:
     if not results:
         return False
@@ -58,7 +79,10 @@ def should_notify_optimization_results(results: list[dict]) -> bool:
     if _env_bool("NOTIFY_ON_TREND_ALERTS", False) and _has_any_trend_alerts(results):
         return True
     return any(
-        _result_change_count(entry) > 0 or (entry.get("result") or {}).get("error")
+        _result_change_count(entry) > 0
+        or (entry.get("result") or {}).get("error")
+        or _waiver_suggestions_for_entry(entry)
+        or (entry.get("result") or {}).get("waiver_error")
         for entry in results
     )
 
@@ -210,6 +234,79 @@ def _trend_alerts_table_html(results: list[dict], max_rows: int) -> tuple[str, l
     return table, []
 
 
+def _positions_text(player: dict) -> str:
+    positions = player.get("eligible_positions") or []
+    if not positions:
+        return ""
+    return "/".join(html.escape(str(position)) for position in positions)
+
+
+def _score_text(value: object) -> str:
+    try:
+        return f"{float(value):+.3f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _waiver_suggestion_row(entry: dict, suggestion: dict) -> str:
+    league = html.escape(_entry_league(entry))
+    label = html.escape(_entry_label(entry))
+    categories = suggestion.get("helps_categories") or []
+    return (
+        "<tr>"
+        f"<td>{league}</td>"
+        f"<td>{label}</td>"
+        f"<td>{html.escape(str(suggestion.get('player') or 'Unknown'))}</td>"
+        f"<td>{html.escape(str(suggestion.get('mlb_team') or ''))}</td>"
+        f"<td>{_positions_text(suggestion)}</td>"
+        f"<td>{_score_text(suggestion.get('weighted_score'))}</td>"
+        f"<td>{_score_text(suggestion.get('score_30d'))}</td>"
+        f"<td>{_score_text(suggestion.get('score_7d'))}</td>"
+        f"<td>{_trend_cell(suggestion.get('at_bats_7d'))}</td>"
+        f"<td>{html.escape(str(suggestion.get('target_reason') or ''))}</td>"
+        f"<td>{html.escape(', '.join(str(category) for category in categories))}</td>"
+        "</tr>"
+    )
+
+
+def _waiver_suggestions_table_html(results: list[dict]) -> str:
+    if not _has_any_waiver_output(results):
+        return ""
+
+    rows: list[str] = []
+    notes: list[str] = []
+    for entry in results:
+        result = entry.get("result") or {}
+        waiver_error = result.get("waiver_error")
+        if waiver_error:
+            notes.append(
+                f"Waiver analysis failed for {_entry_label(entry)}: {waiver_error}"
+            )
+        for suggestion in _waiver_suggestions_for_entry(entry):
+            rows.append(_waiver_suggestion_row(entry, suggestion))
+
+    notes_html = ""
+    if notes:
+        notes_html = "<p><em>" + html.escape(" ".join(notes)) + "</em></p>"
+
+    if not rows:
+        return "<h2>Waiver Wire Suggestions</h2><p>No free-agent targets found.</p>" + notes_html
+
+    return (
+        "<h2>Waiver Wire Suggestions</h2>"
+        "<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">"
+        "<thead><tr>"
+        "<th>League</th><th>Team</th><th>Player</th><th>MLB Team</th>"
+        "<th>Positions</th><th>Need Score</th><th>Last 30 days</th>"
+        "<th>Last 7 days</th><th>AB last 7 days</th><th>Why Target</th>"
+        "<th>Helps Categories</th>"
+        "</tr></thead>"
+        f"<tbody>{''.join(rows)}</tbody>"
+        "</table>"
+        f"{notes_html}"
+    )
+
+
 def _format_team_section(entry: dict) -> str:
     result = entry.get("result") or {}
     summary = result.get("summary") or {}
@@ -243,7 +340,13 @@ def _format_team_section(entry: dict) -> str:
 def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, str]:
     total_changes = sum(_result_change_count(entry) for entry in results)
     trend_total = _total_trend_alert_count(results)
-    subject_suffix = f", trend alerts: {trend_total}" if trend_total > 0 else ""
+    waiver_total = _total_waiver_suggestion_count(results)
+    subject_parts = []
+    if trend_total > 0:
+        subject_parts.append(f"trend alerts: {trend_total}")
+    if waiver_total > 0:
+        subject_parts.append(f"waiver ideas: {waiver_total}")
+    subject_suffix = f", {', '.join(subject_parts)}" if subject_parts else ""
     errors = [entry for entry in results if (entry.get("result") or {}).get("error")]
     labels = [_entry_label(entry) for entry in results]
     target = labels[0] if len(labels) == 1 else f"{len(labels)} teams"
@@ -280,6 +383,7 @@ def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, 
 
     trend_max = _env_int("TREND_ALERT_EMAIL_MAX", 5)
     trend_table_html, _ = _trend_alerts_table_html(results, max_rows=trend_max)
+    waiver_table_html = _waiver_suggestions_table_html(results)
 
     mode = "Dry run" if dry_run else "Auto apply"
     body = (
@@ -289,6 +393,7 @@ def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, 
         f"{''.join(_format_team_section(entry) for entry in results)}"
         f"{table_html}"
         f"{trend_table_html}"
+        f"{waiver_table_html}"
         "</body></html>"
     )
     return subject, body

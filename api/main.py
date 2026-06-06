@@ -27,6 +27,7 @@ from notifier import (
     send_notification,
     should_notify_optimization_results,
 )
+from waiver_optimizer import get_add_drop_suggestions
 from yahoo_api import YahooFantasyAPI
 
 logger = logging.getLogger(__name__)
@@ -215,6 +216,14 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, "").strip() or default)
+    except ValueError:
+        logger.warning("Ignoring invalid %s value: %s", name, os.getenv(name))
+        return default
+
+
 def _lineup_weights() -> tuple[float | None, float | None]:
     def parse_weight(name: str) -> float | None:
         raw_value = os.getenv(name)
@@ -397,10 +406,16 @@ def _run_combined_optimization(
     }
 
 
-def _run_scheduled_optimization(include_pitchers: bool = True) -> None:
+def _run_scheduled_optimization(
+    include_pitchers: bool = True,
+    include_waiver_analysis: bool = True,
+) -> None:
     timezone_name = os.getenv("LINEUP_SCHEDULE_TZ", "US/Eastern")
     auto_apply = _env_bool("LINEUP_AUTO_APPLY", False)
     weight_7d, weight_30d = _lineup_weights()
+    waiver_enabled = _env_bool("WAIVER_ANALYSIS_ENABLED", False) and include_waiver_analysis
+    waiver_fa_count = _env_int("WAIVER_FA_COUNT", 25)
+    waiver_top_n = _env_int("WAIVER_TOP_N", 10)
 
     try:
         api = _get_api()
@@ -421,12 +436,31 @@ def _run_scheduled_optimization(include_pitchers: bool = True) -> None:
                 weight_30d=weight_30d,
                 include_pitchers=include_pitchers,
             )
+            if waiver_enabled:
+                try:
+                    result["waiver_suggestions"] = get_add_drop_suggestions(
+                        api,
+                        team_key,
+                        date=roster_date,
+                        fa_count_per_position=waiver_fa_count,
+                        top_n=waiver_top_n,
+                        weight_7d=weight_7d,
+                        weight_30d=weight_30d,
+                    )
+                except Exception as exc:
+                    logger.exception(
+                        "Waiver analysis failed: team=%s label=%s",
+                        team_key,
+                        profile.get("label"),
+                    )
+                    result["waiver_error"] = str(exc)
             logger.info(
-                "Scheduled lineup optimization finished: team=%s label=%s dry_run=%s include_pitchers=%s pitcher_changes=%d batter_changes=%d total_changes=%d error=%s",
+                "Scheduled lineup optimization finished: team=%s label=%s dry_run=%s include_pitchers=%s waiver_enabled=%s pitcher_changes=%d batter_changes=%d total_changes=%d error=%s",
                 team_key,
                 profile.get("label"),
                 not auto_apply,
                 include_pitchers,
+                waiver_enabled,
                 len(result.get("pitcher_changes") or []),
                 len(result.get("batter_changes") or []),
                 (result.get("summary") or {}).get("total_changes_count", 0),
@@ -785,7 +819,11 @@ def startup_scheduler() -> None:
     _scheduler = BackgroundScheduler(timezone=timezone_name)
     for index, (hour, minute) in enumerate(schedule_times):
         include_pitchers = (not rest_slots_batters_only) or (index == 0)
-        job = partial(_run_scheduled_optimization, include_pitchers=include_pitchers)
+        job = partial(
+            _run_scheduled_optimization,
+            include_pitchers=include_pitchers,
+            include_waiver_analysis=(index == 0),
+        )
         _scheduler.add_job(
             job,
             trigger="cron",
