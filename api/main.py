@@ -12,9 +12,7 @@ from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import RedirectResponse
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 # Import from parent package - run with: uvicorn api.main:app --reload (from fantasy_baseball dir)
@@ -33,7 +31,6 @@ from yahoo_api import YahooFantasyAPI
 logger = logging.getLogger(__name__)
 
 app = FastAPI(title="Fantasy Baseball AI Co-Manager")
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 _scheduler: BackgroundScheduler | None = None
 
 ROBOT_LEAGUE_KEY = os.getenv("ROBOT_LEAGUE_KEY", "469.l.12479")
@@ -488,65 +485,6 @@ def _run_scheduled_optimization(
         logger.exception("Scheduled lineup optimization failed")
 
 
-def _extract_leagues(fantasy_content: dict) -> list[dict]:
-    """Parse Yahoo fantasy_content to extract user leagues (recursive search)."""
-    leagues = []
-    seen = set()
-
-    def find_leagues(obj):
-        if isinstance(obj, dict):
-            if "league_key" in obj and "name" in obj:
-                key = obj.get("league_key")
-                if key and key not in seen:
-                    seen.add(key)
-                    leagues.append(
-                        {
-                            "league_key": key,
-                            "name": obj.get("name", ""),
-                            "num_teams": obj.get("num_teams"),
-                        }
-                    )
-            for value in obj.values():
-                find_leagues(value)
-        elif isinstance(obj, list):
-            for value in obj:
-                find_leagues(value)
-
-    find_leagues(fantasy_content)
-    return leagues
-
-
-def _extract_teams(teams_data: dict) -> list[dict]:
-    """Parse Yahoo teams response to list of {team_key, name}."""
-    teams = []
-    try:
-        teams_obj = teams_data.get("teams", teams_data)
-        for key, value in teams_obj.items():
-            if not key.isdigit():
-                continue
-            team_data = value.get("team", [])
-            team_key = None
-            name = "Unknown"
-            for element in team_data:
-                if isinstance(element, list):
-                    for item in element:
-                        if isinstance(item, dict):
-                            if "team_key" in item:
-                                team_key = item["team_key"]
-                            elif "name" in item:
-                                name = item["name"]
-                elif isinstance(element, dict):
-                    if "team_key" in element:
-                        team_key = element["team_key"]
-                    elif "name" in element:
-                        name = element["name"]
-            if team_key:
-                teams.append({"team_key": team_key, "name": name})
-    except (KeyError, TypeError, AttributeError):
-        pass
-    return teams
-
-
 def _allowed_league_keys() -> frozenset[str]:
     keys = {
         entry["league_key"].strip()
@@ -570,13 +508,20 @@ def get_auth_url():
     return {"url": api.get_auth_url()}
 
 
-@app.get("/auth/callback")
+@app.get("/auth/callback", response_class=HTMLResponse)
 def auth_callback(code: str = Query(...)):
-    """OAuth callback - exchange code for token. Redirect to frontend after."""
+    """OAuth callback - exchange code for token."""
     api = _get_api()
     if api.exchange_code_for_token(code):
-        return RedirectResponse(url="/?auth=success")
-    return RedirectResponse(url="/?auth=failed")
+        return HTMLResponse(
+            "<html><body><h1>Yahoo authentication complete</h1>"
+            "<p>You can close this tab.</p></body></html>"
+        )
+    return HTMLResponse(
+        "<html><body><h1>Yahoo authentication failed</h1>"
+        "<p>Check the service logs and try again.</p></body></html>",
+        status_code=400,
+    )
 
 
 @app.post("/api/auth/exchange")
@@ -588,82 +533,6 @@ def exchange_code(req: ExchangeRequest):
     raise HTTPException(status_code=400, detail="Failed to exchange code")
 
 
-@app.get("/api/leagues")
-def list_leagues():
-    """List user's MLB leagues."""
-    api = _get_api()
-    if not api._ensure_valid_token():
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    content = api.get_user_leagues(game_key=None)
-    if not content:
-        return {"leagues": []}
-    return {"leagues": _extract_leagues(content)}
-
-
-@app.get("/api/leagues/configured")
-def configured_leagues():
-    """Return the app-supported configured leagues for the UI."""
-    return {"leagues": _configured_league_entries()}
-
-
-@app.get("/api/teams/configured")
-def configured_teams():
-    """Return optional saved local team profiles for faster switching in the UI."""
-    api = _get_api()
-    if not api._ensure_valid_token():
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    return {"teams": _resolved_team_profiles(api)}
-
-
-def _run_all_configured_optimizations(
-    api: YahooFantasyAPI,
-    date: str | None = None,
-    dry_run: bool = True,
-) -> dict:
-    profiles = _resolved_team_profiles(api)
-    if not profiles:
-        raise HTTPException(
-            status_code=400,
-            detail="No configured or discoverable local teams were found",
-        )
-
-    weight_7d, weight_30d = _lineup_weights()
-    results: list[dict] = []
-    errors: list[str] = []
-    teams_with_changes = 0
-
-    for profile in profiles:
-        result = _run_combined_optimization(
-            api,
-            profile["team_key"],
-            date=date,
-            dry_run=dry_run,
-            weight_7d=weight_7d,
-            weight_30d=weight_30d,
-        )
-        if (result.get("summary") or {}).get("total_changes_count", 0) > 0:
-            teams_with_changes += 1
-        if result.get("error"):
-            errors.append(f'{profile["label"]}: {result["error"]}')
-        results.append(
-            {
-                "label": profile["label"],
-                "league_key": profile["league_key"],
-                "team_key": profile["team_key"],
-                **result,
-            }
-        )
-
-    return {
-        "date": date or datetime.now().strftime("%Y-%m-%d"),
-        "dry_run": dry_run,
-        "results": results,
-        "teams_processed": len(results),
-        "teams_with_changes": teams_with_changes,
-        "errors": errors,
-    }
-
-
 @app.get("/api/leagues/debug")
 def leagues_debug():
     """Debug: return raw Yahoo API response for leagues."""
@@ -671,18 +540,6 @@ def leagues_debug():
     if not api._ensure_valid_token():
         raise HTTPException(status_code=401, detail="Not authenticated")
     return {"raw": api.get_user_leagues(game_key=None)}
-
-
-@app.get("/api/leagues/{league_key}/teams")
-def list_teams(league_key: str):
-    """List teams in a league."""
-    api = _get_api()
-    if not api._ensure_valid_token():
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    teams_raw = api.get_league_teams(league_key)
-    if not teams_raw:
-        return {"teams": []}
-    return {"teams": _extract_teams({"teams": teams_raw})}
 
 
 @app.get("/api/teams/{team_key}/roster")
@@ -719,29 +576,6 @@ def optimize_lineup_get(
     return optimize_lineup(api, team_key, date=roster_date, dry_run=dry_run)
 
 
-@app.post("/api/optimize-batting-lineup")
-def optimize_batting_lineup_post(
-    team_key: str = Query(...),
-    date: str | None = None,
-    dry_run: bool = Query(True),
-):
-    """Preview or apply combined pitcher and batter lineup optimization."""
-    api = _get_api()
-    if not api._ensure_valid_token():
-        raise HTTPException(status_code=401, detail="Not authenticated")
-
-    weight_7d, weight_30d = _lineup_weights()
-    roster_date = date or datetime.now().strftime("%Y-%m-%d")
-    return _run_combined_optimization(
-        api,
-        team_key,
-        date=roster_date,
-        dry_run=dry_run,
-        weight_7d=weight_7d,
-        weight_30d=weight_30d,
-    )
-
-
 @app.get("/api/roster/trends")
 def roster_trends_get(
     team_key: str = Query(...),
@@ -760,23 +594,6 @@ def roster_trends_get(
         date=roster_date,
         weight_7d=weight_7d,
         weight_30d=weight_30d,
-    )
-
-
-@app.post("/api/optimize-all-lineups")
-def optimize_all_lineups_post(
-    date: str | None = None,
-    dry_run: bool = Query(True),
-):
-    """Preview or apply combined pitcher and batter optimization for all local teams."""
-    api = _get_api()
-    if not api._ensure_valid_token():
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    roster_date = date or datetime.now().strftime("%Y-%m-%d")
-    return _run_all_configured_optimizations(
-        api,
-        date=roster_date,
-        dry_run=dry_run,
     )
 
 
@@ -849,8 +666,3 @@ def shutdown_scheduler() -> None:
     if _scheduler is not None:
         _scheduler.shutdown(wait=False)
         _scheduler = None
-
-
-FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
-if FRONTEND_DIR.exists():
-    app.mount("/", StaticFiles(directory=str(FRONTEND_DIR), html=True), name="frontend")
