@@ -7,6 +7,8 @@ import os
 import sys
 from datetime import datetime
 from functools import partial
+import html
+import json
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -22,6 +24,7 @@ from batter_optimizer import evaluate_roster_trends, optimize_batting_lineup
 from lineup_optimizer import _parse_roster_player, optimize_lineup
 from notifier import (
     format_optimization_email,
+    get_last_email_cache_path,
     send_notification,
     should_notify_optimization_results,
 )
@@ -621,6 +624,44 @@ def add_drop(req: AddDropRequest):
     if resp is None:
         raise HTTPException(status_code=400, detail="Transaction failed")
     return {"success": True}
+
+
+@app.get("/last-email", response_class=HTMLResponse)
+def last_email():
+    """Display the most recently sent lineup notification email."""
+    cache_path = get_last_email_cache_path()
+    if not cache_path.exists():
+        return HTMLResponse(
+            "<html><body><h1>No email sent yet</h1>"
+            "<p>The scheduled job has not sent an email since this cache was added.</p>"
+            "</body></html>"
+        )
+
+    try:
+        payload = json.loads(cache_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.exception("Failed to read last email cache: %s", cache_path)
+        raise HTTPException(status_code=500, detail="Could not read last sent email") from exc
+
+    subject = html.escape(str(payload.get("subject") or "Last sent email"))
+    sent_at = html.escape(str(payload.get("sent_at") or "Unknown send time"))
+    body_html = str(payload.get("html") or "")
+    iframe_body = html.escape(body_html, quote=True)
+    page = (
+        "<!doctype html><html><head><meta charset=\"utf-8\">"
+        "<title>Last Fantasy Baseball Email</title>"
+        "<style>"
+        "body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;background:#f5f5f5;color:#111;}"
+        "header{padding:16px 20px;background:#111;color:#fff;}"
+        "header h1{margin:0 0 6px;font-size:20px;}"
+        "header p{margin:0;color:#d0d0d0;}"
+        "iframe{display:block;width:100%;height:calc(100vh - 86px);border:0;background:#fff;}"
+        "</style></head><body>"
+        f"<header><h1>{subject}</h1><p>Sent at: {sent_at}</p></header>"
+        f"<iframe title=\"Last sent email\" srcdoc=\"{iframe_body}\"></iframe>"
+        "</body></html>"
+    )
+    return HTMLResponse(page)
 
 
 @app.on_event("startup")
