@@ -5,12 +5,31 @@ Email notifications for scheduled fantasy lineup optimizations.
 from __future__ import annotations
 
 import html
+import json
 import logging
 import os
 import smtplib
+from datetime import datetime
 from email.message import EmailMessage
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
+
+
+def get_last_email_cache_path() -> Path:
+    raw_path = os.getenv("LAST_EMAIL_CACHE_PATH", "last_email_cache.json").strip()
+    return Path(raw_path or "last_email_cache.json")
+
+
+def _write_last_email_cache(subject: str, body_html: str) -> None:
+    payload = {
+        "subject": subject,
+        "html": body_html,
+        "sent_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
+    cache_path = get_last_email_cache_path()
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -435,4 +454,8 @@ def send_notification(subject: str, body_html: str) -> bool:
         return False
 
     logger.info("Sent lineup notification email to %s", recipient)
+    try:
+        _write_last_email_cache(subject, body_html)
+    except Exception:
+        logger.exception("Failed to write last email cache")
     return True
