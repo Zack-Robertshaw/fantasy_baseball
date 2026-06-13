@@ -1432,6 +1432,35 @@ class YahooFantasyAPI:
                 record[outcome] += 1
         return records
 
+    def get_current_week_category_standings(self, league_key, team_key) -> dict:
+        """
+        Return this team's live per-category W-L-T outcome for the current matchup week.
+        """
+        current_week = self._league_current_week(league_key)
+        if current_week <= 1:
+            return {}
+
+        settings = self.get_league_scoring_settings(league_key) or {}
+        stat_names_by_id = {
+            str(row.get("stat_id")): row.get("name")
+            for group in (settings.get("batting_categories") or [], settings.get("pitching_categories") or [])
+            for row in group
+            if isinstance(row, dict) and row.get("stat_id")
+        }
+        result = self.make_api_request(f'/league/{league_key}/scoreboard;week={current_week}')
+        if not result:
+            return {}
+
+        records: dict[str, dict[str, int]] = {}
+        for row in self._team_category_results_from_scoreboard(result, team_key, stat_names_by_id):
+            category = str(row.get("category") or row.get("stat_id") or "").strip()
+            outcome = str(row.get("outcome") or "").upper()
+            if not category or outcome not in {"W", "L", "T"}:
+                continue
+            record = records.setdefault(category, {"W": 0, "L": 0, "T": 0})
+            record[outcome] += 1
+        return records
+
     def _league_current_week(self, league_key) -> int:
         info = self.get_league_info(league_key) or {}
         for key in ("current_week", "end_week"):

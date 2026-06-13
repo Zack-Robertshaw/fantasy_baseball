@@ -173,6 +173,58 @@ def _move_rows(entry: dict, section: str, details: list[dict], dry_run: bool) ->
     return rows
 
 
+def _category_focus_line(entry: dict) -> str:
+    result = entry.get("result") or {}
+    summary = result.get("summary") or {}
+    context = summary.get("lineup_category_weight_context") or {}
+    records = context.get("current_week_category_records") or {}
+    names_by_id = context.get("batting_category_names_by_id") or {}
+    blend_factor = context.get("blend_factor")
+    if not context or blend_factor is None:
+        return ""
+
+    batting_names = [str(name) for _, name in sorted(names_by_id.items())]
+    if not batting_names:
+        batting_names = [str(category) for category in records]
+
+    grouped = {"L": [], "T": [], "W": []}
+    for category in batting_names:
+        record = records.get(category) or {}
+        if int(record.get("L") or 0) > 0:
+            grouped["L"].append(category)
+        elif int(record.get("T") or 0) > 0:
+            grouped["T"].append(category)
+        elif int(record.get("W") or 0) > 0:
+            grouped["W"].append(category)
+
+    blend_percent = round(float(blend_factor) * 100)
+    segments = []
+    if grouped["L"]:
+        segments.append("Losing: " + ", ".join(grouped["L"]))
+    if grouped["T"]:
+        segments.append("Tied: " + ", ".join(grouped["T"]))
+    if grouped["W"]:
+        segments.append("Winning: " + ", ".join(grouped["W"]))
+
+    if not segments:
+        segments.append("No live batting category standings found")
+
+    return (
+        f"{_entry_label(entry)} category focus: "
+        f"live matchup blend {blend_percent}%. "
+        + " | ".join(segments)
+    )
+
+
+def _lineup_category_focus_html(results: list[dict]) -> str:
+    lines = [_category_focus_line(entry) for entry in results]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    items = "".join(f"<li>{html.escape(line)}</li>" for line in lines)
+    return f"<p><strong>Lineup category focus</strong></p><ul>{items}</ul>"
+
+
 def _trend_cell(value: object) -> str:
     if value is None:
         return "—"
@@ -385,10 +437,12 @@ def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, 
         rows.extend(_move_rows(entry, "Pitcher", result.get("pitcher_details") or [], dry_run))
         rows.extend(_move_rows(entry, "Batter", result.get("batter_details") or [], dry_run))
 
+    category_focus_html = _lineup_category_focus_html(results)
     table_html = ""
     if rows:
         table_html = (
             "<h2>Lineup Changes</h2>"
+            f"{category_focus_html}"
             "<table border=\"1\" cellpadding=\"6\" cellspacing=\"0\">"
             "<thead><tr>"
             "<th>League</th><th>Team</th><th>Group</th><th>Player</th>"
@@ -398,7 +452,7 @@ def format_optimization_email(results: list[dict], dry_run: bool) -> tuple[str, 
             "</table>"
         )
     else:
-        table_html = "<p>No lineup changes were needed.</p>"
+        table_html = f"{category_focus_html}<p>No lineup changes were needed.</p>"
 
     trend_max = _env_int("TREND_ALERT_EMAIL_MAX", 5)
     trend_table_html, _ = _trend_alerts_table_html(results, max_rows=trend_max)
