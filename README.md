@@ -170,13 +170,46 @@ Higher `wpe_score` means stronger expected performance for the league format. `c
 
 `LINEUP_WEIGHT_7D` and `LINEUP_WEIGHT_30D` can override the recent-window weights. If their total is below `1.0`, the remaining weight is assigned to the season/baseline windows using the default proportions.
 
+### Category-aware lineup weighting
+
+The base `wpe_score` treats every batting category equally. The scheduled lineup optimizer can also calculate a `weighted_wpe_score` that adjusts each category's importance based on team needs.
+
+There are two category-need signals:
+
+- Season-long category record: rebuilt from completed Yahoo matchup scoreboard history
+- Live current-week standings: pulled from the in-progress Yahoo scoreboard for the current matchup
+
+Both signals use the same category urgency formula:
+
+```text
+weight = (losses + 0.5 * ties) / total_matchups
+```
+
+For a completed-season record, this means categories the team often loses receive higher weight. For a single live matchup week, it means:
+
+- Losing a category: high priority
+- Tied in a category: medium priority
+- Winning a category: low priority
+
+The live weekly signal is blended in gradually because early-week scores are noisy and late-week scores are more actionable:
+
+| Day | Season-long needs | Live weekly needs |
+|---|---:|---:|
+| Monday / Tuesday | 100% | 0% |
+| Wednesday / Thursday | 50% | 50% |
+| Friday / Saturday / Sunday | 0% | 100% |
+
+When category weighting is active, lineup slot assignment uses `weighted_wpe_score` while preserving the original `wpe_score` for display, diagnostics, and backwards-compatible consumers. For example, if the team is comfortably winning `HR` but losing `SB`, stolen bases become more valuable when deciding between otherwise similar hitters.
+
 ### Lineup behavior
 
 - Pitchers are untouched by the batter optimizer
+- Pitchers are not ranked by performance stats and are not benched due to ERA, WHIP, strikeouts, saves, wins, or any other statistical performance signal
+- Pitcher moves are schedule/start-status driven: a confirmed starting SP can be activated into an `SP` or `P` slot, and a non-starting pitcher may be benched only to make room
 - Hitters without a scheduled game for the target date are benched
 - Hitters with a game today but confirmed not starting by Yahoo (`is_starting` is `false`) are benched with a distinct reason
 - Hitters whose starting status is unknown (`is_starting` is `null`) remain eligible and are ranked by WPE score
-- Remaining active slots are filled with a global WPE-optimal assignment across all eligible hitters and slots
+- Remaining active slots are filled with a global score-optimal assignment across all eligible hitters and slots, using `weighted_wpe_score` when category weighting is active and `wpe_score` otherwise
 - The endpoint accepts an explicit `date`, so future editable dates can be optimized too
 - Roster edits are sent to Yahoo one player at a time in dependency order so a locked or in-game player only blocks its own move, and chained slot moves can apply cleanly
 

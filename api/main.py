@@ -20,7 +20,13 @@ from pydantic import BaseModel
 # Import from parent package - run with: uvicorn api.main:app --reload (from fantasy_baseball dir)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from batter_optimizer import evaluate_roster_trends, optimize_batting_lineup
+from batter_optimizer import (
+    _blend_category_weights,
+    _derive_category_weights,
+    _week_blend_factor,
+    evaluate_roster_trends,
+    optimize_batting_lineup,
+)
 from lineup_optimizer import _parse_roster_player, optimize_lineup
 from notifier import (
     format_optimization_email,
@@ -336,6 +342,47 @@ def _empty_pitcher_optimization_result() -> dict:
     }
 
 
+def _lineup_category_weight_context(
+    api: YahooFantasyAPI,
+    league_key: str,
+    team_key: str,
+    roster_date: str,
+) -> tuple[dict[str, float] | None, dict]:
+    settings = api.get_league_scoring_settings(league_key) or {}
+    batting_categories = settings.get("batting_categories") or []
+    if not batting_categories:
+        return None, {}
+
+    season_records = api.get_team_category_records(league_key, team_key)
+    current_week_records = api.get_current_week_category_standings(league_key, team_key)
+    season_weights = _derive_category_weights(season_records, batting_categories)
+    current_week_weights = _derive_category_weights(current_week_records, batting_categories)
+    batting_category_names_by_id = {
+        str(row.get("stat_id")): str(row.get("name") or row.get("stat_id"))
+        for row in batting_categories
+        if row.get("stat_id")
+    }
+
+    requested_blend_factor = _week_blend_factor(roster_date)
+    blend_factor = requested_blend_factor if current_week_records else 0.0
+    category_weights = _blend_category_weights(
+        season_weights,
+        current_week_weights,
+        blend_factor,
+    )
+
+    return category_weights, {
+        "blend_factor": blend_factor,
+        "requested_blend_factor": requested_blend_factor,
+        "season_category_records": season_records,
+        "current_week_category_records": current_week_records,
+        "season_category_weights": season_weights,
+        "current_week_category_weights": current_week_weights,
+        "blended_category_weights": category_weights,
+        "batting_category_names_by_id": batting_category_names_by_id,
+    }
+
+
 def _run_combined_optimization(
     api: YahooFantasyAPI,
     team_key: str,
@@ -344,6 +391,8 @@ def _run_combined_optimization(
     weight_7d: float | None = None,
     weight_30d: float | None = None,
     include_pitchers: bool = True,
+    category_weights: dict[str, float] | None = None,
+    category_weight_context: dict | None = None,
 ) -> dict:
     roster_date = date or datetime.now().strftime("%Y-%m-%d")
     if include_pitchers:
@@ -357,6 +406,8 @@ def _run_combined_optimization(
         dry_run=dry_run,
         weight_7d=weight_7d,
         weight_30d=weight_30d,
+        category_weights=category_weights,
+        category_weight_context=category_weight_context,
     )
 
     pitcher_changes = pitcher_result.get("changes") or []
@@ -427,6 +478,13 @@ def _run_scheduled_optimization(
         scheduled_results = []
         for profile in team_profiles:
             team_key = profile["team_key"]
+            league_key = profile.get("league_key") or team_key.split(".t.")[0]
+            category_weights, category_weight_context = _lineup_category_weight_context(
+                api,
+                league_key,
+                team_key,
+                roster_date,
+            )
             result = _run_combined_optimization(
                 api,
                 team_key,
@@ -435,6 +493,8 @@ def _run_scheduled_optimization(
                 weight_7d=weight_7d,
                 weight_30d=weight_30d,
                 include_pitchers=include_pitchers,
+                category_weights=category_weights,
+                category_weight_context=category_weight_context,
             )
             if waiver_enabled:
                 try:
@@ -543,6 +603,57 @@ def leagues_debug():
     if not api._ensure_valid_token():
         raise HTTPException(status_code=401, detail="Not authenticated")
     return {"raw": api.get_user_leagues(game_key=None)}
+
+
+@app.get("/api/debug/scoreboard")
+def scoreboard_debug(league_key: str = Query(...), team_key: str = Query(...)):
+    """
+    Debug: fetch the live current-week scoreboard and show both the raw Yahoo
+    response and what the category W/L/T parser extracts from it.
+
+    Use this to verify what data Yahoo exposes for an in-progress matchup week
+    before building features that depend on it.
+    """
+    api = _get_api()
+    if not api._ensure_valid_token():
+        raise HTTPException(status_code=401, detail="Not authenticated")
+
+    current_week = api._league_current_week(league_key)
+
+    settings = api.get_league_scoring_settings(league_key) or {}
+    stat_names_by_id = {
+        str(row.get("stat_id")): row.get("name")
+        for group in (
+            settings.get("batting_categories") or [],
+            settings.get("pitching_categories") or [],
+        )
+        for row in group
+        if isinstance(row, dict) and row.get("stat_id")
+    }
+
+    raw_response = api.make_api_request(f"/league/{league_key}/scoreboard;week={current_week}")
+    parsed_rows = (
+        api._team_category_results_from_scoreboard(raw_response, team_key, stat_names_by_id)
+        if raw_response
+        else []
+    )
+
+    category_outcomes: dict[str, str] = {}
+    for row in parsed_rows:
+        category = str(row.get("category") or row.get("stat_id") or "").strip()
+        outcome = str(row.get("outcome") or "").upper()
+        if category and outcome in {"W", "L", "T"}:
+            category_outcomes[category] = outcome
+
+    return {
+        "current_week": current_week,
+        "league_key": league_key,
+        "team_key": team_key,
+        "stat_names_by_id": stat_names_by_id,
+        "parsed_category_outcomes": category_outcomes,
+        "parsed_rows_raw": parsed_rows,
+        "raw_scoreboard": raw_response,
+    }
 
 
 @app.get("/api/teams/{team_key}/roster")

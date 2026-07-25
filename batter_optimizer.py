@@ -84,6 +84,50 @@ def _resolved_wpe_weights(
     }
 
 
+def _week_blend_factor(date_str: str) -> float:
+    weekday = datetime.strptime(date_str, "%Y-%m-%d").weekday()
+    if weekday <= 1:
+        return 0.0
+    if weekday <= 3:
+        return 0.5
+    return 1.0
+
+
+def _derive_category_weights(
+    category_records: dict,
+    batting_categories: list[dict],
+) -> dict[str, float]:
+    weights: dict[str, float] = {}
+    for row in batting_categories or []:
+        stat_id = str(row.get("stat_id") or "")
+        if not stat_id or stat_id in NON_SCORING_STAT_IDS:
+            continue
+        category = str(row.get("name") or stat_id)
+        record = category_records.get(category) or category_records.get(stat_id) or {}
+        wins = int(record.get("W") or 0)
+        losses = int(record.get("L") or 0)
+        ties = int(record.get("T") or 0)
+        total = wins + losses + ties
+        weights[stat_id] = round((losses + 0.5 * ties) / total, 3) if total else 0.5
+    return weights
+
+
+def _blend_category_weights(
+    season_weights: dict[str, float],
+    current_week_weights: dict[str, float],
+    blend_factor: float,
+) -> dict[str, float]:
+    stat_ids = set(season_weights) | set(current_week_weights)
+    return {
+        stat_id: round(
+            ((1 - blend_factor) * float(season_weights.get(stat_id, 0.5)))
+            + (blend_factor * float(current_week_weights.get(stat_id, 0.5))),
+            3,
+        )
+        for stat_id in stat_ids
+    }
+
+
 def _slot_name(slot: str) -> str:
     value = str(slot or "").strip()
     upper = value.upper()
@@ -430,7 +474,12 @@ def _player_evaluation_fields(player: dict) -> dict:
         "score_26": player.get("score_26"),
         "score_30d": player.get("score_30d"),
         "score_7d": player.get("score_7d"),
+        "weighted_score_25": player.get("weighted_score_25"),
+        "weighted_score_26": player.get("weighted_score_26"),
+        "weighted_score_30d": player.get("weighted_score_30d"),
+        "weighted_score_7d": player.get("weighted_score_7d"),
         "wpe_score": player.get("wpe_score"),
+        "weighted_wpe_score": player.get("weighted_wpe_score"),
         "composite_score": player.get("composite_score"),
         "diagnostic_label": player.get("diagnostic_label"),
         "diagnostic_action": player.get("diagnostic_action"),
@@ -444,6 +493,7 @@ def _scored_roster_context(
     date: Optional[str],
     weight_7d: Optional[float],
     weight_30d: Optional[float],
+    category_weights: Optional[dict[str, float]] = None,
 ) -> tuple[str, str, dict, list[dict], list[dict]]:
     date = _today(date)
     league_key = _league_key_from_team_key(team_key)
@@ -467,6 +517,7 @@ def _scored_roster_context(
         batting_categories,
         weight_7d,
         weight_30d,
+        category_weights,
     )
     return date, league_key, settings, batting_categories, players
 
@@ -476,6 +527,7 @@ def _apply_recent_stat_scores(
     batting_categories: list[dict],
     weight_7d: Optional[float],
     weight_30d: Optional[float],
+    category_weights: Optional[dict[str, float]] = None,
 ) -> list[dict]:
     stat_ids = _scoring_stat_ids(batting_categories)
     if not stat_ids:
@@ -510,6 +562,7 @@ def _apply_recent_stat_scores(
     for player in players:
         z_scores_by_window: dict[str, dict[str, float]] = {window: {} for window in windows}
         scores_by_window: dict[str, float] = {window: 0.0 for window in windows}
+        weighted_scores_by_window: dict[str, float] = {window: 0.0 for window in windows}
         stats_by_window = {
             window: player.get(f"stats_{window}") or {}
             for window in windows
@@ -521,6 +574,8 @@ def _apply_recent_stat_scores(
                 z_score = 0.0 if stdev_value == 0 else (value - mean_value) / stdev_value
                 z_scores_by_window[window][stat_id] = round(z_score, 3)
                 scores_by_window[window] += z_score
+                if category_weights is not None:
+                    weighted_scores_by_window[window] += z_score * category_weights.get(stat_id, 0.5)
 
         rounded_score_25 = round(scores_by_window["25"], 3)
         rounded_score_26 = round(scores_by_window["26"], 3)
@@ -532,6 +587,21 @@ def _apply_recent_stat_scores(
             + (wpe_weights["score_26"] * rounded_score_26)
             + (wpe_weights["score_25"] * rounded_score_25),
             3,
+        )
+        weighted_score_25 = round(weighted_scores_by_window["25"], 3) if category_weights is not None else None
+        weighted_score_26 = round(weighted_scores_by_window["26"], 3) if category_weights is not None else None
+        weighted_score_30d = round(weighted_scores_by_window["30d"], 3) if category_weights is not None else None
+        weighted_score_7d = round(weighted_scores_by_window["7d"], 3) if category_weights is not None else None
+        weighted_wpe_score = (
+            round(
+                (wpe_weights["score_7d"] * weighted_score_7d)
+                + (wpe_weights["score_30d"] * weighted_score_30d)
+                + (wpe_weights["score_26"] * weighted_score_26)
+                + (wpe_weights["score_25"] * weighted_score_25),
+                3,
+            )
+            if category_weights is not None
+            else None
         )
         composite_score = wpe_score
         at_bats_7d = _parse_at_bats_from_hits_at_bats(stats_by_window["7d"].get("60"))
@@ -546,7 +616,12 @@ def _apply_recent_stat_scores(
             "score_26": rounded_score_26,
             "score_30d": rounded_score_30d,
             "score_7d": rounded_score_7d,
+            "weighted_score_25": weighted_score_25,
+            "weighted_score_26": weighted_score_26,
+            "weighted_score_30d": weighted_score_30d,
+            "weighted_score_7d": weighted_score_7d,
             "wpe_score": wpe_score,
+            "weighted_wpe_score": weighted_wpe_score,
             # Keep composite_score for older UI/email consumers; it now means WPE.
             "composite_score": composite_score,
             **_trend_metrics(rounded_score_7d, rounded_score_30d, at_bats_7d),
@@ -557,7 +632,7 @@ def _apply_recent_stat_scores(
     return sorted(
         _apply_absolute_floor_signals(scored_players),
         key=lambda player: (
-            -(player.get("wpe_score") or 0.0),
+            -_numeric_player_score(player, _lineup_score_field(player), default=0.0),
             -(player.get("score_26") or 0.0),
             player.get("name", ""),
         ),
@@ -568,7 +643,7 @@ def _sorted_candidates(players: list[dict], slot: str) -> list[dict]:
     return sorted(
         [player for player in players if _player_can_fill_slot(player, slot)],
         key=lambda player: (
-            -_numeric_player_score(player, "wpe_score"),
+            -_numeric_player_score(player, _lineup_score_field(player)),
             -_numeric_player_score(player, "score_26"),
             player.get("name", ""),
         ),
@@ -585,21 +660,29 @@ def _numeric_player_score(player: dict, field: str, default: float = -9999.0) ->
         return default
 
 
+def _lineup_score_field(player: dict) -> str:
+    return "weighted_wpe_score" if player.get("weighted_wpe_score") is not None else "wpe_score"
+
+
 def _best_candidate(candidates: list[dict]) -> dict | None:
     if not candidates:
         return None
     ordered = sorted(
         candidates,
         key=lambda player: (
-            -_numeric_player_score(player, "wpe_score"),
+            -_numeric_player_score(player, _lineup_score_field(player)),
             player.get("name", ""),
         ),
     )
     best = ordered[0]
+    best_score_field = _lineup_score_field(best)
     tied = [
         player
         for player in ordered
-        if abs((player.get("wpe_score") or 0.0) - (best.get("wpe_score") or 0.0)) < WPE_TIE_THRESHOLD
+        if abs(
+            _numeric_player_score(player, _lineup_score_field(player), default=0.0)
+            - _numeric_player_score(best, best_score_field, default=0.0)
+        ) < WPE_TIE_THRESHOLD
     ]
     if len(tied) <= 1:
         return best
@@ -638,7 +721,7 @@ def _assign_slots(players: list[dict], active_slots: list[str]) -> tuple[dict[st
     def score_with_player(score: tuple[int, float, float], player: dict) -> tuple[int, float, float]:
         return (
             score[0] + 1,
-            score[1] + _numeric_player_score(player, "wpe_score"),
+            score[1] + _numeric_player_score(player, _lineup_score_field(player)),
             score[2] + _numeric_player_score(player, "score_26"),
         )
 
@@ -708,7 +791,11 @@ def _assign_slots(players: list[dict], active_slots: list[str]) -> tuple[dict[st
                 "action": "start",
                 "player": player["name"],
                 "to": slot,
-                "reason": "Globally optimal WPE assignment across active batting slots",
+                "reason": (
+                    "Globally optimal category-weighted WPE assignment across active batting slots"
+                    if player.get("weighted_wpe_score") is not None
+                    else "Globally optimal WPE assignment across active batting slots"
+                ),
                 **_player_evaluation_fields(player),
             }
         )
@@ -722,6 +809,8 @@ def get_optimal_batting_lineup_changes(
     date: Optional[str] = None,
     weight_7d: Optional[float] = None,
     weight_30d: Optional[float] = None,
+    category_weights: Optional[dict[str, float]] = None,
+    category_weight_context: Optional[dict] = None,
 ) -> tuple[list[tuple[str, str]], list[dict], dict]:
     """
     Compute batting-only lineup changes based on four-window WPE scores.
@@ -735,6 +824,7 @@ def get_optimal_batting_lineup_changes(
         date,
         weight_7d,
         weight_30d,
+        category_weights,
     )
     wpe_weights = _resolved_wpe_weights(weight_7d, weight_30d)
 
@@ -750,6 +840,8 @@ def get_optimal_batting_lineup_changes(
             "team_key": team_key,
             "league_key": league_key,
             "wpe_weights": wpe_weights,
+            "lineup_category_weights": category_weights,
+            "lineup_category_weight_context": category_weight_context or {},
             "score_mode": "four_window_wpe",
             "movable_batters": 0,
             "playing_batters": 0,
@@ -802,6 +894,8 @@ def get_optimal_batting_lineup_changes(
                         if player.get("has_game_today") is False
                         else "Confirmed not in starting lineup"
                         if player.get("is_starting") is False
+                        else "Category-weighted performance expectation optimization"
+                        if category_weights is not None
                         else "Weighted performance expectation optimization"
                     ),
                     **_player_evaluation_fields(player),
@@ -819,6 +913,8 @@ def get_optimal_batting_lineup_changes(
         "league_key": league_key,
         "wpe_weights": wpe_weights,
         "wpe_tie_threshold": WPE_TIE_THRESHOLD,
+        "lineup_category_weights": category_weights,
+        "lineup_category_weight_context": category_weight_context or {},
         "score_mode": "four_window_wpe",
         "scoring_stat_ids": _scoring_stat_ids(batting_categories),
         "movable_batters": len(movable_batters),
@@ -895,6 +991,8 @@ def optimize_batting_lineup(
     dry_run: bool = True,
     weight_7d: Optional[float] = None,
     weight_30d: Optional[float] = None,
+    category_weights: Optional[dict[str, float]] = None,
+    category_weight_context: Optional[dict] = None,
 ) -> dict:
     """
     Optimize batter slots and optionally apply the resulting Yahoo roster updates.
@@ -906,6 +1004,8 @@ def optimize_batting_lineup(
         date=date,
         weight_7d=weight_7d,
         weight_30d=weight_30d,
+        category_weights=category_weights,
+        category_weight_context=category_weight_context,
     )
 
     result = {
