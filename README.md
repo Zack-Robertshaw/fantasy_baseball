@@ -14,14 +14,16 @@ The app will evaluate and update a roster automatically on a schedule. During ea
 pip install -r requirements.txt
 ```
 
-### 2. Register a Yahoo developer app
+### 2. Request Yahoo Fantasy API access and configure OAuth
 
-1. Go to [developer.yahoo.com/apps/create](https://developer.yahoo.com/apps/create/)
-2. Create a **Web Application** with **Fantasy Sports Read/Write** permissions
-3. Expose your local app through a public HTTPS tunnel, such as ngrok, Cloudflare Tunnel, or another tunneling service
-4. Set the Yahoo redirect URI to your public tunnel callback URL, for example `https://your-ngrok-domain.ngrok-free.app/auth/callback`
-5. Keep the tunnel running while authenticating so Yahoo can reach your local `/auth/callback` endpoint
-6. Copy your **Client ID** and **Client Secret**
+As of July 2026, Yahoo reviews Fantasy Sports API access per application. OAuth credentials alone do not grant access to Fantasy endpoints.
+
+1. Submit the [Yahoo Fantasy Sports API access form](https://sports.yahoo.com/developer/access/). If you already have a Yahoo Developer Network app, enter its existing App ID; do not delete and recreate it.
+2. Yahoo grants read-only access by default. This app can generate lineup recommendations with read access, but `LINEUP_AUTO_APPLY=true` requires read/write access. Explain the private, owner-only lineup automation use case in the form's notes when requesting write access.
+3. After Yahoo approves the application, create or update the associated **Web Application** as instructed and copy its **Client ID** and **Client Secret**.
+4. Expose the app through a public HTTPS tunnel, such as ngrok or Cloudflare Tunnel.
+5. Set the Yahoo redirect URI to the tunnel callback URL, for example `https://your-ngrok-domain.ngrok-free.app/auth/callback`.
+6. Keep the tunnel running while authenticating so Yahoo can reach the `/auth/callback` endpoint.
 
 ### 3. Configure environment variables
 
@@ -312,6 +314,9 @@ The URI in your Yahoo developer app must exactly match `YAHOO_REDIRECT_URI` in `
 **"Not authenticated" errors**  
 Tokens may have expired. Visit [http://localhost:8000](http://localhost:8000) and reconnect Yahoo, or run `./start.sh` if the refresh token is also stale.
 
+**Every Yahoo Fantasy request returns `403 "This application is not authorized to perform this action"`**  
+If OAuth token refresh succeeds but Fantasy endpoints still return this response, the credentials are valid but Yahoo has not approved the application for Fantasy API access. Submit the existing App ID through the [Yahoo Fantasy Sports API access form](https://sports.yahoo.com/developer/access/). Re-authenticating, re-saving the permission checkbox, or creating a replacement app will not bypass the approval gate. Read-only approval supports roster inspection and lineup recommendations; automatic roster updates require Yahoo to approve read/write access.
+
 **Rotating credentials**  
 Go to [developer.yahoo.com/apps](https://developer.yahoo.com/apps/), regenerate your client secret, update `.env`, restart the server, and re-authenticate once.
 
@@ -459,5 +464,5 @@ Use this as a handoff block for a future chat.
 
 ## Data sources
 
-- [Yahoo Fantasy Sports API](https://developer.yahoo.com/fantasysports/guide/) for league, roster, player, and transaction data
+- [Yahoo Fantasy Sports API](https://sports.yahoo.com/developer/) for league, roster, player, and transaction data
 - [MLB Stats API](https://statsapi.mlb.com) for schedule and player information
